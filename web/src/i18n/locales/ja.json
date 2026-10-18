@@ -972,6 +972,8 @@
     "Bulk actions for {{count}} selected records": "選択した {{count}} 件への一括操作",
     "by": "によって",
     "By category": "カテゴリ別",
+    "By clicking sign in, you agree to our": "ログインすることで、以下に同意したものとみなされます：",
+    "By creating an account, you agree to our": "アカウントを作成することで、以下に同意したものとみなされます：",
     "By model author": "モデル提供者別",
     "By quota": "クォータ別",
     "By requests": "リクエスト数別",

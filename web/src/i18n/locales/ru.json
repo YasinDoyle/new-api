@@ -972,6 +972,8 @@
     "Bulk actions for {{count}} selected records": "Групповые действия для {{count}} записей",
     "by": "от",
     "By category": "По категориям",
+    "By clicking sign in, you agree to our": "Нажимая «Войти», вы принимаете следующие документы:",
+    "By creating an account, you agree to our": "Создавая аккаунт, вы принимаете следующие документы:",
     "By model author": "По автору модели",
     "By quota": "По квоте",
     "By requests": "По запросам",
