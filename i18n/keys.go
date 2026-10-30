@@ -6,6 +6,9 @@ package i18n
 
 // Errors returned to AI clients
 const (
+	MsgEstimateInvalidRequest = "estimate.invalid_request"
+	MsgEstimateUnsupported    = "estimate.unsupported"
+	MsgEstimatePricingFailed  = "estimate.pricing_failed"
 	MsgDatabaseError          = "common.database_error"
 	MsgAuthUserBanned         = "auth.user_banned"
 	MsgTokenGetInfoFailed     = "token.get_info_failed"

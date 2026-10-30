@@ -1,4 +1,7 @@
 # English translations
+estimate.invalid_request: "Invalid estimate request"
+estimate.unsupported: "This request does not support cost estimation"
+estimate.pricing_failed: "Unable to calculate the request price"
 
 # Errors returned to AI clients
 common.database_error: "Database error, please contact the administrator"

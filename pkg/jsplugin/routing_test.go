@@ -815,6 +815,11 @@ func TestDeclarativeRouteValidationProtectsNamespacesAndCanonicalSyntax(t *testi
 			expectedError: "reserved namespace /v1/tasks",
 		},
 		{
+			name:          "request estimation",
+			route:         Route{Method: "POST", Path: "/v1/requests/estimate", Type: RouteTypeSubmit},
+			expectedError: "reserved namespace /v1/requests",
+		},
+		{
 			name:          "SPA root",
 			route:         Route{Method: "POST", Path: "/console/jobs", Type: RouteTypeSubmit},
 			expectedError: "reserved namespace /console",

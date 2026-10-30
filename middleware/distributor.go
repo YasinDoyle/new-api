@@ -32,6 +32,14 @@ type ModelRequest struct {
 }
 
 func Distribute() func(c *gin.Context) {
+	return distribute(false)
+}
+
+func DistributeForEstimate() gin.HandlerFunc {
+	return distribute(true)
+}
+
+func distribute(estimate bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var channel *model.Channel
 		defer func() {
@@ -108,7 +116,11 @@ func Distribute() func(c *gin.Context) {
 				}
 			}
 			if channel == nil {
-				channel, _, selectErr = service.SelectChannelForRequest(c, modelRequest.Model, &service.RetryParam{
+				selectChannel := service.SelectChannelForRequest
+				if estimate {
+					selectChannel = service.SelectChannelForEstimate
+				}
+				channel, _, selectErr = selectChannel(c, modelRequest.Model, &service.RetryParam{
 					Ctx:         c,
 					ModelName:   modelRequest.Model,
 					TokenGroup:  usingGroup,
@@ -131,9 +143,12 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+		if channelErr := setupContextForSelectedChannel(c, channel, modelRequest.Model, estimate); channelErr != nil && estimate {
+			abortWithOpenAiMessage(c, channelErr.StatusCode, channelErr.Error())
+			return
+		}
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+		if !estimate && channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
@@ -558,6 +573,10 @@ func getTaskOriginModelName(c *gin.Context) string {
 }
 
 func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
+	return setupContextForSelectedChannel(c, channel, modelName, false)
+}
+
+func setupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string, estimate bool) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	expectedPlugin := c.GetString("expected_task_plugin_key")
 	if channel == nil {
@@ -628,6 +647,9 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
+	if estimate {
+		return nil
+	}
 	key, index, newAPIError := channel.GetNextEnabledKey()
 	if newAPIError != nil {
 		return newAPIError

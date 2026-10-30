@@ -17,6 +17,8 @@ func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.DecompressRequestMiddleware())
 	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	router.Use(middleware.StatsMiddleware())
+	const chatPath = "/chat/completions"
+	router.POST("/v1/requests/estimate", middleware.EstimateRateLimit(), middleware.EstimateTokenAuth(), middleware.EstimateTarget("/v1"+chatPath), middleware.DistributeForEstimate(), controller.RequestEstimate)
 	// https://platform.openai.com/docs/api-reference/introduction
 	modelsRouter := router.Group("/v1/models")
 	modelsRouter.Use(middleware.RouteTag("relay"))
@@ -102,7 +104,7 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/completions", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAI)
 		})
-		httpRouter.POST("/chat/completions", func(c *gin.Context) {
+		httpRouter.POST(chatPath, func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAI)
 		})
 
