@@ -47,6 +47,26 @@ func registerRequestEstimateRoute(method, path string, relayFormat types.RelayFo
 	requestEstimateRouteFormat[key] = relayFormat
 }
 
+func registerRequestEstimateTaskRoute(method, path string) {
+	requestEstimateRouteMu.Lock()
+	defer requestEstimateRouteMu.Unlock()
+	if requestEstimateRouter == nil {
+		return
+	}
+	key := method + " " + path
+	if existing, ok := requestEstimateRouteFormat[key]; ok && existing != types.RelayFormatTask {
+		panic("request estimate route has conflicting relay format: " + key)
+	}
+	if _, exists := requestEstimateRouteFormat[key]; exists {
+		return
+	}
+	requestEstimateRouter.Handle(method, path, func(c *gin.Context) {
+		c.Header("X-Request-Estimate-Relay-Format", string(types.RelayFormatTask))
+		c.Header("X-Request-Estimate-Task-Plugin-Key", c.Param("key"))
+	})
+	requestEstimateRouteFormat[key] = types.RelayFormatTask
+}
+
 func resolveRequestEstimateRoute(method, path string) (types.RelayFormat, bool) {
 	requestEstimateRouteMu.RLock()
 	defer requestEstimateRouteMu.RUnlock()

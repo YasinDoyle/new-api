@@ -1434,10 +1434,14 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 	// buildSubmitRequest runs before quota is reserved, so a failed fetch
 	// costs nothing; requests that start vendor work stay the descriptor.
 	fetchContext := c.Request.Context()
-	if info.HasChannelMeta() {
+	if info.HasChannelMeta() && !c.GetBool("request_estimate") {
 		fetchContext = pluginruntime.WithFetcher(fetchContext, a.hookFetcher(info.ChannelBaseUrl, info.ChannelSetting.Proxy))
 	}
-	descriptor, err := a.requestDescriptor(fetchContext, "buildSubmitRequest", a.submitContext(c, info))
+	hookContext := a.submitContext(c, info)
+	if _, authFailed := hookContext["authError"]; authFailed {
+		return nil, fmt.Errorf("plugin authentication preparation failed")
+	}
+	descriptor, err := a.requestDescriptor(fetchContext, "buildSubmitRequest", hookContext)
 	if err != nil {
 		reason := "hook_failed"
 		var invalid *pluginruntime.ResultError

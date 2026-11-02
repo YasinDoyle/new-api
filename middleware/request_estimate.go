@@ -62,6 +62,15 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
 			return
 		}
+		taskPluginKey := ""
+		if relayFormat == types.RelayFormatTask {
+			parts := strings.Split(strings.Trim(target.Path, "/"), "/")
+			if len(parts) != 3 || parts[0] != "v1" || parts[1] != "tasks" || strings.TrimSpace(parts[2]) == "" {
+				abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
+				return
+			}
+			taskPluginKey = parts[2]
+		}
 		body := []byte(envelope.Body)
 		if envelope.BodyBase64 != nil {
 			body, err = base64.StdEncoding.Strict().DecodeString(*envelope.BodyBase64)
@@ -174,12 +183,26 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 		inner.ContentLength = int64(len(body))
 		common.CleanupBodyStorage(c)
 		c.Request = inner
+		defer func() { common.CleanupBodyStorage(c); c.Request = outer }()
 		c.Set("estimate_relay_format", relayFormat)
 		c.Set("request_estimate", true)
+		if taskPluginKey != "" {
+			generation := pluginruntime.DefaultRegistry.Generation()
+			plugin, exists := generation.Get(taskPluginKey)
+			if !exists {
+				abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
+				return
+			}
+			if status, message := prepareTaskPluginSubmitRequest(c, taskPluginKey, generation, plugin); status != 0 {
+				abortWithOpenAiMessage(c, status, message, types.ErrorCodeInvalidRequest)
+				return
+			}
+			c.Set("task_plugin_key", taskPluginKey)
+			c.Set("platform", taskPluginKey)
+		}
 		if len(mediaInfo) > 0 {
 			c.Set(common.RequestEstimateMediaInfoContextKey, mediaInfo)
 		}
-		defer func() { common.CleanupBodyStorage(c); c.Request = outer }()
 		if relayFormat == types.RelayFormatOpenAIResponses {
 			generation := pluginruntime.DefaultRegistry.Generation()
 			if modelRequest, modelErr := getModelFromRequest(c); modelErr == nil && generation != nil {

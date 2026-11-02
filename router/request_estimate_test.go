@@ -25,8 +25,10 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -922,4 +924,170 @@ func TestRequestEstimateContract(t *testing.T) {
 		model.InitChannelCache()
 		assert.Equal(t, 503, quote(token.Key).Code, "deleted channel disappears after cache publication")
 	})
+}
+
+func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
+	setupRequestEstimateDB(t)
+	savedConfig := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(k, v string) error { savedConfig[k] = v; return nil }))
+	savedPrices := ratio_setting.ModelPrice2JSONString()
+	savedPluginRegistry := pluginruntime.DefaultRegistry
+	t.Cleanup(func() {
+		pluginruntime.DefaultRegistry = savedPluginRegistry
+		require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices))
+	})
+
+	registry := pluginruntime.NewRegistry()
+	plugin, err := registry.Register(`
+		export const meta = {
+		  apiVersion: 1, key: "estimate-task", name: "Estimate task", version: "1.0.0",
+		  author: {name: "Test"}, models: ["task-estimate-model"], fetchMode: "per_task",
+		  usageSchema: {seconds: {type: "number", unit: "second"}}
+		};
+		export function buildSubmitRequest(ctx) {
+		  if (ctx.upstreamModel !== "mapped-task-estimate-model") throw new Error("model was not mapped before validation");
+		  if (ctx.apiKey !== "channel-secret-b") throw new Error("wrong estimated key");
+		  if (ctx.originTasks !== undefined) throw new Error("unresolved origin tasks were exposed");
+		  return {url: ctx.baseUrl + "/submit", method: "POST", body: {model: ctx.model}};
+		}
+		export function extractUsage() { return {seconds: 2}; }
+		export function parseSubmitResponse() { return {taskId: "unused"}; }
+		export function buildQueryRequest() { return {}; }
+		export function parseTaskResult() { return {status: "SUCCESS"}; }
+	`, pluginruntime.Options{})
+	require.NoError(t, err)
+	pluginruntime.DefaultRegistry = registry
+
+	variants, err := common.Marshal(map[string]string{billing_setting.PluginBillingExprKey(plugin.Meta.Key, "task-estimate-model"): `tier("base", u("seconds") * 0.2)`})
+	require.NoError(t, err)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(variants)}))
+
+	var providerCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerCalls.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(upstream.Close)
+	user := model.User{Username: "task-estimate-user", Status: common.UserStatusEnabled, Group: "default", Quota: 0}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "taskestimatekey", Status: common.TokenStatusExhausted, ExpiredTime: -1}
+	require.NoError(t, model.DB.Create(&token).Error)
+	modelMapping := `{"task-estimate-model":"mapped-task-estimate-model"}`
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "channel-secret-a\nchannel-secret-b", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "task-estimate-model", ModelMapping: &modelMapping, Group: "default", ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling, MultiKeyPollingIndex: 1}}
+	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "task-estimate-model", ChannelId: channel.Id, Enabled: true}).Error)
+	model.InitChannelCache()
+
+	engine := gin.New()
+	require.NoError(t, engine.SetTrustedProxies(nil))
+	SetRelayRouter(engine)
+	SetTaskRouter(engine)
+	SetTaskPluginProtocolRouter(engine)
+
+	request := func(path, body string) *httptest.ResponseRecorder {
+		payload, marshalErr := common.Marshal(map[string]any{"method": http.MethodPost, "path": path, "body": common.RawMessage(body)})
+		require.NoError(t, marshalErr)
+		response := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(payload))
+		r.Header.Set("Authorization", "Bearer "+token.Key)
+		r.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(response, r)
+		return response
+	}
+
+	snapshot := func() map[string]string {
+		state := map[string]string{}
+		for _, table := range []string{"users", "tokens", "channels", "abilities", "logs", "tasks", "user_subscriptions", "subscription_pre_consume_records"} {
+			var rows []map[string]any
+			require.NoError(t, model.DB.Table(table).Find(&rows).Error)
+			data, marshalErr := common.Marshal(rows)
+			require.NoError(t, marshalErr)
+			state[table] = string(data)
+		}
+		return state
+	}
+	before := snapshot()
+	quote := request("/v1/tasks/"+plugin.Meta.Key, `{"model":"task-estimate-model","metadata":{"originTaskIds":["forged-task"]}}`)
+	require.Equal(t, http.StatusOK, quote.Code, quote.Body.String())
+	var result map[string]any
+	require.NoError(t, common.Unmarshal(quote.Body.Bytes(), &result))
+	assert.Equal(t, float64(200000), result["quota"])
+	assert.Equal(t, "0.4", result["amount"])
+	assert.Equal(t, plugin.Meta.Key, result["channel"].(map[string]any)["plugin"])
+	assert.Zero(t, providerCalls.Load(), "a task estimate must never send the submit descriptor")
+	assert.Equal(t, before, snapshot(), "estimate must not persist business state or advance key polling")
+
+	legacyPlugin, err := registry.Register(`
+		export const meta = {apiVersion:1,key:"estimate-legacy-task",name:"Estimate legacy task",version:"1.0.0",author:{name:"Test"},models:["legacy-task-model"],fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second"}}};
+		export function buildSubmitRequest(ctx) { return {url:ctx.baseUrl+"/submit"}; }
+		export function extractUsage() { return {seconds:2}; }
+		export function parseSubmitResponse() { return {taskId:"unused"}; }
+		export function buildQueryRequest() { return {}; }
+		export function parseTaskResult() { return {status:"SUCCESS"}; }
+	`, pluginruntime.Options{})
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"legacy-task-model":0.01}`))
+	legacyChannel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "legacy-secret", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "legacy-task-model", Group: "default"}
+	legacyChannel.SetSetting(dto.ChannelSettings{TaskPluginKey: legacyPlugin.Meta.Key})
+	require.NoError(t, model.DB.Create(&legacyChannel).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "legacy-task-model", ChannelId: legacyChannel.Id, Enabled: true}).Error)
+	model.InitChannelCache()
+	legacyQuote := request("/v1/tasks/"+legacyPlugin.Meta.Key, `{"model":"legacy-task-model"}`)
+	require.Equal(t, http.StatusOK, legacyQuote.Code, legacyQuote.Body.String())
+	var legacyResult map[string]any
+	require.NoError(t, common.Unmarshal(legacyQuote.Body.Bytes(), &legacyResult))
+	assert.Equal(t, float64(10000), legacyResult["quota"], "legacy per-call pricing applies validated usage ratios once")
+	assert.Equal(t, "0.02", legacyResult["amount"])
+
+	invalidPlugin, err := registry.Register(`
+		export const meta = {apiVersion:1,key:"estimate-invalid-usage",name:"Estimate invalid usage",version:"1.0.0",author:{name:"Test"},models:["invalid-usage-model"],fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second"}}};
+		export function buildSubmitRequest(ctx) { return {url:ctx.baseUrl+"/submit"}; }
+		export function extractUsage() { return {seconds:3601}; }
+		export function parseSubmitResponse() { return {taskId:"unused"}; }
+		export function buildQueryRequest() { return {}; }
+		export function parseTaskResult() { return {status:"SUCCESS"}; }
+	`, pluginruntime.Options{})
+	require.NoError(t, err)
+	invalidChannel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "invalid-secret", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "invalid-usage-model", Group: "default"}
+	invalidChannel.SetSetting(dto.ChannelSettings{TaskPluginKey: invalidPlugin.Meta.Key})
+	require.NoError(t, model.DB.Create(&invalidChannel).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "invalid-usage-model", ChannelId: invalidChannel.Id, Enabled: true}).Error)
+	model.InitChannelCache()
+	invalidQuote := request("/v1/tasks/"+invalidPlugin.Meta.Key, `{"model":"invalid-usage-model"}`)
+	assert.Equal(t, http.StatusBadRequest, invalidQuote.Code, invalidQuote.Body.String())
+
+	fetchTrap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { providerCalls.Add(1) }))
+	t.Cleanup(fetchTrap.Close)
+	fetchPlugin, err := registry.Register(`
+		export const meta = {
+		  apiVersion: 1, key: "estimate-fetch-task", name: "Estimate fetch task", version: "1.0.0",
+		  author: {name: "Test"}, models: ["fetch-model"], fetchMode: "per_task",
+		  usageSchema: {seconds: {type: "number", unit: "second"}}
+		};
+		export function buildSubmitRequest(ctx) {
+		  return utils.fetch("`+fetchTrap.URL+`/inference", {method: "GET"}).then(function() { return {url: ctx.baseUrl + "/submit"}; });
+		}
+		export function extractUsage() { return {seconds: 1}; }
+		export function parseSubmitResponse() { return {taskId: "unused"}; }
+		export function buildQueryRequest() { return {}; }
+		export function parseTaskResult() { return {status: "SUCCESS"}; }
+	`, pluginruntime.Options{})
+	require.NoError(t, err)
+	fetchChannel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "fetch-secret", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "fetch-model", Group: "default"}
+	fetchChannel.SetSetting(dto.ChannelSettings{TaskPluginKey: fetchPlugin.Meta.Key})
+	require.NoError(t, model.DB.Create(&fetchChannel).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "fetch-model", ChannelId: fetchChannel.Id, Enabled: true}).Error)
+	model.InitChannelCache()
+	beforeFetch := snapshot()
+	fetchVariants, err := common.Marshal(map[string]string{billing_setting.PluginBillingExprKey(fetchPlugin.Meta.Key, "fetch-model"): `tier("base", u("seconds") * 0.2)`})
+	require.NoError(t, err)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(fetchVariants)}))
+	fetchQuote := request("/v1/tasks/"+fetchPlugin.Meta.Key, `{"model":"fetch-model"}`)
+	assert.NotEqual(t, http.StatusOK, fetchQuote.Code, fetchQuote.Body.String())
+	assert.Equal(t, beforeFetch, snapshot(), "failed preparation must not persist business state")
+	assert.Zero(t, providerCalls.Load(), "arbitrary plugin fetches, including GET inference, must be rejected before network access")
+	assert.NotContains(t, fetchQuote.Body.String(), "channel-secret")
+	assert.NotContains(t, fetchQuote.Body.String(), "fetch-secret")
 }

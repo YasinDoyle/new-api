@@ -21,6 +21,10 @@ import (
 
 // RequestEstimate stops at nominal pricing and never starts an upstream attempt.
 func RequestEstimate(c *gin.Context, relayFormat types.RelayFormat) {
+	if relayFormat == types.RelayFormatTask {
+		requestEstimateTask(c)
+		return
+	}
 	request, err := helper.GetAndValidateRequest(c, relayFormat)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimateInvalidRequest), "type": "invalid_request_error", "code": "invalid_request"}})
@@ -80,5 +84,40 @@ func RequestEstimate(c *gin.Context, relayFormat types.RelayFormat) {
 		"amount":   decimal.NewFromInt(int64(quota)).Div(decimal.NewFromFloat(common.QuotaPerUnit)).String(),
 		"currency": "USD", "model": info.GetBillingModelName(), "group": info.UsingGroup,
 		"channel": gin.H{"id": c.GetInt("channel_id"), "type": c.GetInt("channel_type")},
+	})
+}
+
+func requestEstimateTask(c *gin.Context) {
+	info, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": "estimate_pricing_failed"}})
+		return
+	}
+	prepared, taskErr := relay.PrepareTaskBilling(c, info)
+	if taskErr != nil {
+		status := taskErr.StatusCode
+		if status == 0 {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": taskErr.Code}})
+		return
+	}
+	quota := info.PriceData.Quota
+	if info.TieredBillingSnapshot != nil {
+		if snapshot, refreshErr := service.RefreshTieredBillingGroup(info); refreshErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": "estimate_pricing_failed"}})
+			return
+		} else if snapshot != nil {
+			quota = snapshot.EstimatedQuotaAfterGroup
+		}
+	}
+	if quota < 0 || info.QuotaClamp != nil || common.QuotaPerUnit <= 0 || math.IsNaN(common.QuotaPerUnit) || math.IsInf(common.QuotaPerUnit, 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": "estimate_pricing_failed"}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"quota": quota, "amount": decimal.NewFromInt(int64(quota)).Div(decimal.NewFromFloat(common.QuotaPerUnit)).String(),
+		"currency": "USD", "model": info.GetBillingModelName(), "group": info.UsingGroup,
+		"channel": gin.H{"id": c.GetInt("channel_id"), "type": c.GetInt("channel_type"), "plugin": prepared.Platform},
 	})
 }

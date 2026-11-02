@@ -1477,73 +1477,61 @@ func PrepareTaskPluginSubmit() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "task plugin not found", "type": "invalid_request_error"}})
 			return
 		}
-		c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{
-			Generation: generation,
-			Plugin:     plugin,
-		})
-		logger.LogDebug(
-			c,
-			"task_plugin subsystem=route event=legacy_entry_pinned generation=%d plugin=%q version=%q",
-			generation.Number,
-			plugin.Meta.Key,
-			plugin.Meta.Version,
-		)
-		var requestBody map[string]any
-		if err := common.UnmarshalBodyReusable(c, &requestBody); err != nil {
-			c.AbortWithStatusJSON(invalidRequestStatus(err), gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
+		if status, message := prepareTaskPluginSubmitRequest(c, pluginKey, generation, plugin); status != 0 {
+			c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"message": message, "type": "invalid_request_error"}})
 			return
 		}
-		modelName, _ := requestBody["model"].(string)
-		if strings.TrimSpace(modelName) == "" {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "model is required", "type": "invalid_request_error"}})
-			return
-		}
-		exactOwned := slices.Contains(plugin.Meta.Models, modelName)
-		exactAlias := false
-		if target, resolved := model.ResolveTaskModelAlias(generation, modelName); resolved && target.Alias == modelName && target.PluginKey == plugin.Meta.Key {
-			exactAlias = true
-		}
-		if !exactOwned && !exactAlias {
-			folded := ""
-			if declared, ok := generation.CanonicalModel(modelName); ok && slices.Contains(plugin.Meta.Models, declared) && declared != modelName {
-				folded = declared
-			} else if target, resolved := model.ResolveTaskModelAlias(generation, modelName); resolved && target.PluginKey == plugin.Meta.Key && target.Alias != "" && target.Alias != modelName {
-				folded = target.Alias
-			}
-			if folded != "" {
-				if rewriteErr := rewriteTaskPluginJSONModel(c, folded); rewriteErr != nil {
-					c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": rewriteErr.Error(), "type": "invalid_request_error"}})
-					return
-				}
-				requestBody["model"] = folded
-				modelName = folded
-			}
-		}
-		c.Set("task_request", requestBody)
-		if plugin.Meta.PreservesJSONOrder() {
-			// The body as stored after any model rewrite: the text hooks get.
-			storage, err := common.GetBodyStorage(c)
-			var raw []byte
-			if err == nil {
-				raw, err = storage.Bytes()
-			}
-			if err != nil {
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
-				return
-			}
-			c.Set(pluginruntime.ContextKeyRequestBodyText, json.RawMessage(raw))
-		}
-		c.Set("resolved_task_model", modelName)
-		c.Set("expected_task_plugin_key", pluginKey)
-		service.AppendTaskPluginIdentityFilter(c, pluginKey)
-		c.Set("relay_mode", relayconstant.RelayModeVideoSubmit)
-		logger.LogDebug(
-			c,
-			"task_plugin subsystem=route event=resolved generation=%d plugin=%q kind=submit model=%q distribute=true entry=legacy",
-			generation.Number,
-			plugin.Meta.Key,
-			modelName,
-		)
 		c.Next()
 	}
+}
+
+func prepareTaskPluginSubmitRequest(c *gin.Context, pluginKey string, generation *pluginruntime.RoutingGeneration, plugin *pluginruntime.LoadedPlugin) (int, string) {
+	c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: generation, Plugin: plugin})
+	logger.LogDebug(c, "task_plugin subsystem=route event=legacy_entry_pinned generation=%d plugin=%q version=%q", generation.Number, plugin.Meta.Key, plugin.Meta.Version)
+	var requestBody map[string]any
+	if err := common.UnmarshalBodyReusable(c, &requestBody); err != nil {
+		return invalidRequestStatus(err), err.Error()
+	}
+	modelName, _ := requestBody["model"].(string)
+	if strings.TrimSpace(modelName) == "" {
+		return http.StatusBadRequest, "model is required"
+	}
+	exactOwned := slices.Contains(plugin.Meta.Models, modelName)
+	exactAlias := false
+	if target, resolved := model.ResolveTaskModelAlias(generation, modelName); resolved && target.Alias == modelName && target.PluginKey == plugin.Meta.Key {
+		exactAlias = true
+	}
+	if !exactOwned && !exactAlias {
+		folded := ""
+		if declared, ok := generation.CanonicalModel(modelName); ok && slices.Contains(plugin.Meta.Models, declared) && declared != modelName {
+			folded = declared
+		} else if target, resolved := model.ResolveTaskModelAlias(generation, modelName); resolved && target.PluginKey == plugin.Meta.Key && target.Alias != "" && target.Alias != modelName {
+			folded = target.Alias
+		}
+		if folded != "" {
+			if rewriteErr := rewriteTaskPluginJSONModel(c, folded); rewriteErr != nil {
+				return http.StatusBadRequest, rewriteErr.Error()
+			}
+			requestBody["model"] = folded
+			modelName = folded
+		}
+	}
+	c.Set("task_request", requestBody)
+	if plugin.Meta.PreservesJSONOrder() {
+		storage, err := common.GetBodyStorage(c)
+		var raw []byte
+		if err == nil {
+			raw, err = storage.Bytes()
+		}
+		if err != nil {
+			return http.StatusBadRequest, err.Error()
+		}
+		c.Set(pluginruntime.ContextKeyRequestBodyText, json.RawMessage(raw))
+	}
+	c.Set("resolved_task_model", modelName)
+	c.Set("expected_task_plugin_key", pluginKey)
+	service.AppendTaskPluginIdentityFilter(c, pluginKey)
+	c.Set("relay_mode", relayconstant.RelayModeVideoSubmit)
+	logger.LogDebug(c, "task_plugin subsystem=route event=resolved generation=%d plugin=%q kind=submit model=%q distribute=true entry=legacy", generation.Number, plugin.Meta.Key, modelName)
+	return 0, ""
 }
