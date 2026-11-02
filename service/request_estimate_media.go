@@ -1,18 +1,17 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"io"
 	"mime"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
-	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -116,46 +115,23 @@ func requestEstimateImageConfig(c *gin.Context, rawURL string) (image.Config, st
 }
 
 func requestEstimateDoDownload(c *gin.Context, rawURL string) (*http.Response, error) {
-	protection, err := requestEstimateFetchProtection()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	response, err := DoDownloadRequestContext(ctx, rawURL, "request_estimate")
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	if err = protection.ValidateURL(rawURL); err != nil {
-		return nil, err
-	}
-
-	var response *http.Response
-	if system_setting.EnableWorker() && system_setting.GetFetchSetting().EnableSSRFProtection {
-		response, err = DoDownloadRequest(rawURL, "request_estimate")
-	} else {
-		client := newProtectedFetchHTTPClientWithProxy(nil, nil, func() (*common.SSRFProtection, bool, error) {
-			return protection, true, nil
-		}, func(*http.Request) (*url.URL, error) { return nil, nil })
-		client.Timeout = 15 * time.Second
-		request, requestErr := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, rawURL, nil)
-		if requestErr != nil {
-			return nil, requestErr
-		}
-		response, err = client.Do(request)
-	}
-	if err != nil {
-		return nil, err
-	}
+	response.Body = &requestEstimateResponseBody{ReadCloser: response.Body, cancel: cancel}
 	return response, nil
 }
 
-func requestEstimateFetchProtection() (*common.SSRFProtection, error) {
-	fetchSetting := system_setting.GetFetchSetting()
-	if fetchSetting.EnableSSRFProtection {
-		return common.NewSSRFProtectionFromFetchSetting(
-			fetchSetting.AllowPrivateIp,
-			fetchSetting.DomainFilterMode,
-			fetchSetting.IpFilterMode,
-			fetchSetting.DomainList,
-			fetchSetting.IpList,
-			fetchSetting.AllowedPorts,
-			fetchSetting.ApplyIPFilterForDomain,
-		)
-	}
-	return &common.SSRFProtection{AllowedPorts: []int{80, 443}, ApplyIPFilterForDomain: true}, nil
+type requestEstimateResponseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *requestEstimateResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }

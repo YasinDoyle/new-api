@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -199,16 +201,18 @@ func TestProtectedFetchDialerSkipsResolvedIPCheckWhenDisabled(t *testing.T) {
 	require.Equal(t, []string{"safe.example:80"}, dialed)
 }
 
-func TestRequestEstimateImageConfigUsesProtectedWorker(t *testing.T) {
+func TestRequestEstimateImageConfigUsesConfiguredWorker(t *testing.T) {
 	previousClient := httpClient
 	previousWorkerURL, previousWorkerKey := system_setting.WorkerUrl, system_setting.WorkerValidKey
 	previousAllowHTTP := system_setting.WorkerAllowHttpImageRequestEnabled
+	previousMaxFileDownloadMB := constant.MaxFileDownloadMB
 	fetchSetting := system_setting.GetFetchSetting()
 	previousFetchSetting := *fetchSetting
 	t.Cleanup(func() {
 		httpClient = previousClient
 		system_setting.WorkerUrl, system_setting.WorkerValidKey = previousWorkerURL, previousWorkerKey
 		system_setting.WorkerAllowHttpImageRequestEnabled = previousAllowHTTP
+		constant.MaxFileDownloadMB = previousMaxFileDownloadMB
 		*fetchSetting = previousFetchSetting
 	})
 
@@ -222,6 +226,18 @@ func TestRequestEstimateImageConfigUsesProtectedWorker(t *testing.T) {
 			http.Error(w, "invalid worker request", http.StatusBadRequest)
 			return
 		}
+		if strings.HasSuffix(workerRequest.URL, "/unavailable") {
+			http.Error(w, "media unavailable", http.StatusBadGateway)
+			return
+		}
+		if strings.HasSuffix(workerRequest.URL, "/invalid") {
+			_, _ = w.Write([]byte("not an image"))
+			return
+		}
+		if strings.HasSuffix(workerRequest.URL, "/oversized") {
+			_, _ = w.Write(bytes.Repeat([]byte{'x'}, (1<<20)+1))
+			return
+		}
 		_, _ = w.Write(imageBytes.Bytes())
 	}))
 	t.Cleanup(worker.Close)
@@ -229,15 +245,16 @@ func TestRequestEstimateImageConfigUsesProtectedWorker(t *testing.T) {
 	system_setting.WorkerUrl = worker.URL + "/"
 	system_setting.WorkerValidKey = "worker-test-key"
 	system_setting.WorkerAllowHttpImageRequestEnabled = true
-	fetchSetting.EnableSSRFProtection = true
-	fetchSetting.AllowPrivateIp = true
+	fetchSetting.EnableSSRFProtection = false
+	fetchSetting.AllowPrivateIp = false
 	fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode = false, false
 	fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts = nil, nil, nil
 	fetchSetting.ApplyIPFilterForDomain = true
 
-	context, _ := gin.CreateTestContext(httptest.NewRecorder())
-	context.Request = httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", nil)
-	config, format, err := requestEstimateImageConfig(context, "http://127.0.0.1:8123/image.png")
+	ginContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginContext.Request = httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", nil)
+	constant.MaxFileDownloadMB = 1
+	config, format, err := requestEstimateImageConfig(ginContext, "http://127.0.0.1:8123/image.png")
 	require.NoError(t, err)
 	require.Equal(t, 1, config.Width)
 	require.Equal(t, 1, config.Height)
@@ -246,10 +263,26 @@ func TestRequestEstimateImageConfigUsesProtectedWorker(t *testing.T) {
 	require.Equal(t, "worker-test-key", workerRequest.Key)
 	require.Equal(t, 1, workerCalls)
 
-	fetchSetting.AllowPrivateIp = false
-	_, _, err = requestEstimateImageConfig(context, "http://127.0.0.1:8123/image.png")
+	_, _, err = requestEstimateImageConfig(ginContext, "http://127.0.0.1:8123/unavailable")
 	require.Error(t, err)
-	require.Equal(t, 1, workerCalls, "private destinations must be rejected before the worker request")
+	require.Contains(t, err.Error(), "status 502")
+	require.Equal(t, 2, workerCalls)
+
+	_, _, err = requestEstimateImageConfig(ginContext, "http://127.0.0.1:8123/invalid")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "decode image config")
+	require.Equal(t, 3, workerCalls)
+	_, _, err = requestEstimateImageConfig(ginContext, "http://127.0.0.1:8123/oversized")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "size limit")
+	require.Equal(t, 4, workerCalls)
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	ginContext.Request = httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", nil).WithContext(requestContext)
+	_, _, err = requestEstimateImageConfig(ginContext, "http://127.0.0.1:8123/image.png")
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 4, workerCalls, "a canceled estimate must not continue waiting on the Worker")
 }
 
 func TestGetSSRFProtectedHTTPClientFallsBackToDefaultClientWhenProtectionDisabled(t *testing.T) {

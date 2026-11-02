@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"image"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -120,11 +122,11 @@ func TestRequestEstimateContract(t *testing.T) {
 		}
 		return state
 	}
-	quote := func(auth string) *httptest.ResponseRecorder {
+	quoteWithContext := func(auth string, ctx context.Context) *httptest.ResponseRecorder {
 		data, err := common.Marshal(envelope)
 		require.NoError(t, err)
 		before := snapshot()
-		r := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", strings.NewReader(string(data)))
+		r := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", strings.NewReader(string(data))).WithContext(ctx)
 		r.Header.Set("Authorization", "Bearer "+auth)
 		r.Header.Set("Content-Type", "application/json")
 		r.RemoteAddr = "192.0.2.10:1234"
@@ -136,6 +138,9 @@ func TestRequestEstimateContract(t *testing.T) {
 		assert.NotContains(t, w.Body.String(), "secret-one")
 		assert.NotContains(t, w.Body.String(), upstream.URL)
 		return w
+	}
+	quote := func(auth string) *httptest.ResponseRecorder {
+		return quoteWithContext(auth, context.Background())
 	}
 	t.Run("identity restrictions survive inner credentials", func(t *testing.T) {
 		unauthorized := httptest.NewRecorder()
@@ -376,21 +381,25 @@ func TestRequestEstimateContract(t *testing.T) {
 		delete(envelope, "media_info")
 		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
 	})
-	t.Run("image URL measurements take precedence and remain SSRF protected", func(t *testing.T) {
+	t.Run("image URL measurements take precedence and report media failures", func(t *testing.T) {
 		savedCount, savedRatio := constant.CountToken, ratio_setting.ModelRatio2JSONString()
+		savedMaxFileDownloadMB := constant.MaxFileDownloadMB
 		savedMediaToken, savedMediaTokenNotStream := constant.GetMediaToken, constant.GetMediaTokenNotStream
 		fetchSetting := system_setting.GetFetchSetting()
 		savedFetch := *fetchSetting
 		constant.CountToken = true
+		constant.MaxFileDownloadMB = 1
 		constant.GetMediaToken, constant.GetMediaTokenNotStream = true, true
 		fetchSetting.EnableSSRFProtection = true
 		fetchSetting.AllowPrivateIp = true
 		fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode = false, false
 		fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts = nil, nil, nil
 		fetchSetting.ApplyIPFilterForDomain = true
+		service.InitHttpClient()
 		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":0.01}`))
 		t.Cleanup(func() {
 			constant.CountToken = savedCount
+			constant.MaxFileDownloadMB = savedMaxFileDownloadMB
 			constant.GetMediaToken, constant.GetMediaTokenNotStream = savedMediaToken, savedMediaTokenNotStream
 			*fetchSetting = savedFetch
 			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatio))
@@ -444,14 +453,75 @@ func TestRequestEstimateContract(t *testing.T) {
 		assert.Contains(t, failedQuote.Body.String(), "media_read_failed")
 		assert.EqualValues(t, 3, calls.Load(), "a failed URL read must not fall back to the supplied dimensions")
 
+		previousWorkerURL, previousWorkerKey := system_setting.WorkerUrl, system_setting.WorkerValidKey
+		previousAllowWorkerHTTP := system_setting.WorkerAllowHttpImageRequestEnabled
+		t.Cleanup(func() {
+			system_setting.WorkerUrl, system_setting.WorkerValidKey = previousWorkerURL, previousWorkerKey
+			system_setting.WorkerAllowHttpImageRequestEnabled = previousAllowWorkerHTTP
+		})
+		var workerCalls atomic.Int32
+		worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			workerCalls.Add(1)
+			var request service.WorkerRequest
+			require.NoError(t, common.DecodeJson(r.Body, &request))
+			assert.Contains(t, request.URL, "http://127.0.0.1:8123/")
+			assert.Equal(t, "estimate-worker-key", request.Key)
+			if request.URL == "http://127.0.0.1:8123/slow.png" {
+				<-r.Context().Done()
+				return
+			}
+			switch request.URL {
+			case "http://127.0.0.1:8123/unavailable.png":
+				http.Error(w, "media unavailable", http.StatusBadGateway)
+			case "http://127.0.0.1:8123/empty.png":
+			case "http://127.0.0.1:8123/invalid.png":
+				_, _ = w.Write([]byte("not an image"))
+			case "http://127.0.0.1:8123/oversized.png":
+				_, _ = w.Write(bytes.Repeat([]byte{'x'}, (1<<20)+1))
+			default:
+				_, _ = w.Write(pngBytes)
+			}
+		}))
+		t.Cleanup(worker.Close)
+		system_setting.WorkerUrl = worker.URL
+		system_setting.WorkerValidKey = "estimate-worker-key"
+		system_setting.WorkerAllowHttpImageRequestEnabled = true
 		fetchSetting.EnableSSRFProtection = false
-		privateURL := fmt.Sprintf("http://127.0.0.1:%s/image.png", strings.Split(mediaServer.Listener.Addr().String(), ":")[1])
-		imageBody = fmt.Sprintf(`{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":%q,"detail":"high"}}]}]}`, privateURL)
-		before := calls.Load()
+		mediaServerFails = false
+		imageBody = `{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://127.0.0.1:8123/image.png","detail":"high"}}]}]}`
+		envelope["method"], envelope["path"], envelope["body"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(imageBody)
+		envelope["headers"] = http.Header{"Content-Type": {"application/json"}}
+		envelope["media_info"] = []map[string]any{{"pointer": "/messages/0/content/0/image_url/url", "type": "image", "width": 4096, "height": 4096}}
+		workerQuote := quote(token.Key)
+		require.Equal(t, http.StatusOK, workerQuote.Code, workerQuote.Body.String())
+		var workerResult map[string]any
+		require.NoError(t, common.Unmarshal(workerQuote.Body.Bytes(), &workerResult))
+		assert.Equal(t, float64(2), workerResult["quota"])
+		assert.Equal(t, "0.000004", workerResult["amount"])
+		assert.EqualValues(t, 1, workerCalls.Load())
+		assert.EqualValues(t, 3, calls.Load(), "Worker-backed estimation must not fetch the media URL directly")
+
+		for _, path := range []string{"unavailable.png", "empty.png", "invalid.png", "oversized.png"} {
+			imageBody = fmt.Sprintf(`{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":%q,"detail":"high"}}]}]}`, "http://127.0.0.1:8123/"+path)
+			envelope["body"] = common.RawMessage(imageBody)
+			failedWorkerQuote := quote(token.Key)
+			assert.Equal(t, http.StatusBadRequest, failedWorkerQuote.Code, failedWorkerQuote.Body.String())
+			assert.Contains(t, failedWorkerQuote.Body.String(), "media_read_failed")
+		}
+		assert.EqualValues(t, 5, workerCalls.Load())
+		assert.EqualValues(t, 3, calls.Load(), "Worker media failures must not fetch the media URL directly")
+
+		imageBody = `{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://127.0.0.1:8123/slow.png","detail":"high"}}]}]}`
+		envelope["body"] = common.RawMessage(imageBody)
 		envelope["media_info"] = []map[string]any{{"pointer": "/messages/0/content/0/image_url/url", "type": "image", "width": 1, "height": 1}}
-		w := quote(token.Key)
-		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-		assert.Equal(t, before, calls.Load(), "private URLs must be rejected before a network request")
+		requestContext, cancelRequest := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		timeoutQuote := quoteWithContext(token.Key, requestContext)
+		cancelRequest()
+		assert.Equal(t, http.StatusGatewayTimeout, timeoutQuote.Code, timeoutQuote.Body.String())
+		assert.Contains(t, timeoutQuote.Body.String(), "media_read_failed")
+		assert.EqualValues(t, 6, workerCalls.Load())
+		assert.EqualValues(t, 3, calls.Load(), "a timed-out URL read must not fall back to supplied dimensions")
+
 		delete(envelope, "media_info")
 		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
 	})

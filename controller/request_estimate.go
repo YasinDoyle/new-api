@@ -40,7 +40,7 @@ func RequestEstimate(c *gin.Context, relayFormat types.RelayFormat) {
 		if apiErr.GetErrorCode() == types.ErrorCodeCountTokenFailed {
 			status := http.StatusBadRequest
 			var timeoutError net.Error
-			if errors.Is(apiErr, context.DeadlineExceeded) || (errors.As(apiErr, &timeoutError) && timeoutError.Timeout()) {
+			if errors.Is(c.Request.Context().Err(), context.DeadlineExceeded) || errors.Is(apiErr, context.DeadlineExceeded) || (errors.As(apiErr, &timeoutError) && timeoutError.Timeout()) {
 				status = http.StatusGatewayTimeout
 			}
 			c.JSON(status, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimateMediaFailed), "type": "invalid_request_error", "code": "media_read_failed"}})
