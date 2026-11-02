@@ -59,7 +59,7 @@ func distribute(estimate bool) gin.HandlerFunc {
 			return
 		}
 		_, pinned, _ := constraints.ResolvedPin()
-		if !pinned {
+		if !pinned || strings.Contains(c.Request.URL.Path, "/mj/") {
 			// Select a channel for the user
 			// check token model mapping
 			modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
@@ -379,7 +379,6 @@ func getJSONStringValue(result gjson.Result, field string) (string, error) {
 func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 	var modelRequest ModelRequest
 	shouldSelectChannel := true
-	var err error
 	if modelName := c.GetString("resolved_task_model"); modelName != "" {
 		modelRequest.Model = modelName
 	} else if strings.Contains(c.Request.URL.Path, "/mj/") {
@@ -390,24 +389,22 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 			relayMode == relayconstant.RelayModeMidjourneyTaskImageSeed {
 			shouldSelectChannel = false
 		} else {
-			midjourneyRequest := taskdto.MidjourneyRequest{}
-			err = common.UnmarshalBodyReusable(c, &midjourneyRequest)
-			if err != nil {
+			// Keep body read errors intact so oversized requests still return 413.
+			if _, err := common.GetRequestBody(c); err != nil {
 				return nil, false, err
 			}
-			midjourneyModel, mjErr, success := service.GetMjRequestModel(relayMode, &midjourneyRequest)
+			prepared, mjErr := service.PrepareMidjourneySubmit(c, c.GetInt("id"), relayMode)
 			if mjErr != nil {
 				return nil, false, fmt.Errorf("%s", mjErr.Description)
 			}
-			if midjourneyModel == "" {
-				if !success {
-					return nil, false, fmt.Errorf("%s", i18n.T(c, i18n.MsgDistributorInvalidParseModel))
-				} else {
-					// task fetch, task fetch by condition, notify
-					shouldSelectChannel = false
+			if prepared.OriginChannelID > 0 {
+				constraints := service.GetChannelConstraints(c)
+				constraints.AddPin(taskdto.ChannelPin{ChannelId: prepared.OriginChannelID, Source: taskdto.PinSourceOriginTask, Rank: taskdto.PinRankOriginTask, RetryMode: taskdto.PinRetrySameChannel})
+				if pin, _, _ := constraints.ResolvedPin(); pin.ChannelId != prepared.OriginChannelID {
+					return nil, false, errors.New("origin_task_channel_mismatch")
 				}
 			}
-			modelRequest.Model = midjourneyModel
+			modelRequest.Model = prepared.ModelName
 		}
 		c.Set("relay_mode", relayMode)
 	} else if strings.Contains(c.Request.URL.Path, "/v1/videos/") && strings.HasSuffix(c.Request.URL.Path, "/remix") {

@@ -78,11 +78,11 @@ func setupRequestEstimateDB(t *testing.T) {
 		require.NoError(t, model.InitDB())
 		model.LOG_DB = model.DB
 		// Each run owns the entire disposable database; start from empty fixtures.
-		for _, table := range []any{&model.Ability{}, &model.Token{}, &model.User{}, &model.Channel{}, &model.Log{}, &model.Task{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}} {
+		for _, table := range []any{&model.Ability{}, &model.Token{}, &model.User{}, &model.Channel{}, &model.Log{}, &model.Task{}, &model.Midjourney{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}} {
 			require.NoError(t, model.DB.Migrator().DropTable(table))
 		}
 	}
-	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}, &model.Channel{}, &model.Log{}, &model.Task{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}, &model.Channel{}, &model.Log{}, &model.Task{}, &model.Midjourney{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}))
 	var version string
 	query := "SELECT version()"
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
@@ -95,7 +95,7 @@ func setupRequestEstimateDB(t *testing.T) {
 func requestEstimateBusinessSnapshot(t *testing.T) map[string]string {
 	t.Helper()
 	state := map[string]string{}
-	for _, table := range []string{"users", "tokens", "channels", "abilities", "logs", "tasks", "user_subscriptions", "subscription_pre_consume_records"} {
+	for _, table := range []string{"users", "tokens", "channels", "abilities", "logs", "tasks", "midjourneys", "user_subscriptions", "subscription_pre_consume_records"} {
 		var rows []map[string]any
 		require.NoError(t, model.DB.Table(table).Find(&rows).Error)
 		data, err := common.Marshal(rows)
@@ -103,6 +103,231 @@ func requestEstimateBusinessSnapshot(t *testing.T) map[string]string {
 		state[table] = string(data)
 	}
 	return state
+}
+
+func TestRequestEstimateLegacyMidjourney(t *testing.T) {
+	setupRequestEstimateDB(t)
+	savedPrice := ratio_setting.ModelPrice2JSONString()
+	savedGroup := ratio_setting.GroupRatio2JSONString()
+	savedGroupGroup := ratio_setting.GroupGroupRatio2JSONString()
+	savedMemory := common.MemoryCacheEnabled
+	savedQuotaUnit, savedStatusCheck := common.QuotaPerUnit, setting.MjActionCheckSuccessEnabled
+	common.MemoryCacheEnabled = false
+	common.QuotaPerUnit, setting.MjActionCheckSuccessEnabled = 500000, true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = savedMemory
+		common.QuotaPerUnit, setting.MjActionCheckSuccessEnabled = savedQuotaUnit, savedStatusCheck
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrice))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(savedGroup))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(savedGroupGroup))
+	})
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"mj_imagine":0.01,"swap_face":0.02,"mj_upscale":0.04,"mj_variation":0.08,"mj_inpaint":0.1,"mj_custom_zoom":0.1,"mj_modal":0.12,"mj_describe":0.04,"mj_blend":0.04,"mj_edits":0.04,"mj_shorten":0.04,"mj_video":0.04,"mj_reroll":0.04,"mj_zoom":0.04,"mj_pan":0.04,"mj_low_variation":0.04,"mj_high_variation":0.04}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1.5}`))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{}`))
+	var calls atomic.Int32
+	var submitResult atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if code := submitResult.Load(); code != 0 {
+			if r.URL.Path == "/mj/submit/simple-change" {
+				assert.True(t, strings.HasPrefix(r.Header.Get("mj-api-secret"), "mj-origin-secret-"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, err := fmt.Fprintf(w, `{"code":%d,"result":"submitted-%d"}`, code, calls.Load())
+			assert.NoError(t, err)
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(upstream.Close)
+	user := model.User{Username: "legacy-estimate", Status: common.UserStatusEnabled, Group: "default", Quota: 0}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "legacyestimatekey", Status: common.TokenStatusExhausted, ExpiredTime: -1}
+	require.NoError(t, model.DB.Create(&token).Error)
+	channel := model.Channel{Type: constant.ChannelTypeMidjourney, Status: common.ChannelStatusEnabled, Key: "mj-secret-one\nmj-secret-two", BaseURL: &upstream.URL, Group: "default", Models: "mj_imagine,swap_face,mj_upscale,mj_variation,mj_inpaint,mj_custom_zoom,mj_modal,mj_describe,mj_blend,mj_edits,mj_shorten,mj_video,mj_reroll,mj_zoom,mj_pan,mj_low_variation,mj_high_variation", Priority: new(int64(10)), ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	originChannel := channel
+	originChannel.Id, originChannel.Priority = 0, new(int64(1))
+	originChannel.Type = constant.ChannelTypeMidjourneyPlus
+	originChannel.Key = "mj-origin-secret-one\nmj-origin-secret-two"
+	require.NoError(t, model.DB.Create(&originChannel).Error)
+	for name := range strings.SplitSeq(channel.Models, ",") {
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: name, ChannelId: channel.Id, Enabled: true, Priority: channel.Priority}).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: name, ChannelId: originChannel.Id, Enabled: true, Priority: originChannel.Priority}).Error)
+	}
+	require.NoError(t, model.DB.Create(&model.Midjourney{UserId: user.Id, MjId: "owned", Status: "SUCCESS", ChannelId: originChannel.Id, Prompt: "original prompt"}).Error)
+	require.NoError(t, model.DB.Create(&model.Midjourney{UserId: user.Id + 1, MjId: "foreign", Status: "SUCCESS", ChannelId: originChannel.Id}).Error)
+	require.NoError(t, model.DB.Create(&model.Midjourney{UserId: user.Id, MjId: "pending", Status: "IN_PROGRESS", ChannelId: originChannel.Id}).Error)
+	engine := gin.New()
+	require.NoError(t, engine.SetTrustedProxies(nil))
+	SetRelayRouter(engine)
+	quote := func(t *testing.T, method, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		before := requestEstimateBusinessSnapshot(t)
+		data, err := common.Marshal(map[string]any{"method": method, "path": path, "body": common.RawMessage(body), "headers": http.Header{"Mj-Api-Secret": {"forged-secret"}, "Authorization": {"Bearer forged"}}})
+		require.NoError(t, err)
+		r := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(data))
+		r.Header.Set("Authorization", "Bearer "+token.Key)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, r)
+		assert.Equal(t, before, requestEstimateBusinessSnapshot(t))
+		assert.Zero(t, calls.Load())
+		for _, secret := range []string{"mj-secret", "mj-origin-secret", "forged-secret", upstream.URL} {
+			assert.NotContains(t, w.Body.String(), secret)
+		}
+		return w
+	}
+	for _, tc := range []struct {
+		name, path, body, amount, model string
+		quota                           int
+		origin                          bool
+	}{
+		{"imagine with zero balance", "/mj/submit/imagine", `{"prompt":"a cat"}`, "0.015", "mj_imagine", 7500, false},
+		{"swap does not read URL media", "/mj/insight-face/swap", fmt.Sprintf(`{"sourceBase64":%q,"targetBase64":%q}`, upstream.URL+"/source", upstream.URL+"/target"), "0.03", "swap_face", 15000, false},
+		{"simple change binds origin", "/fast/mj/submit/simple-change", `{"content":"owned u2"}`, "0.06", "mj_upscale", 30000, true},
+		{"ordinary variation", "/mj/submit/change", `{"taskId":"owned","action":"VARIATION","index":3}`, "0.12", "mj_variation", 60000, true},
+		{"plus action", "/mj/submit/action", `{"taskId":"owned","customId":"MJ::JOB::upsample::2::job"}`, "0.06", "mj_upscale", 30000, true},
+		{"free inpaint", "/mj/submit/action", `{"taskId":"owned","customId":"MJ::Inpaint::job"}`, "0", "mj_inpaint", 0, true},
+		{"free custom zoom", "/mj/submit/action", `{"taskId":"owned","customId":"MJ::CustomZoom::job"}`, "0", "mj_custom_zoom", 0, true},
+		{"modal permits pending origin", "/mj/submit/modal", `{"taskId":"pending"}`, "0.18", "mj_modal", 90000, true},
+		{"video with origin", "/mj/submit/video", `{"taskId":"owned"}`, "0.06", "mj_video", 30000, true},
+		{"video without origin", "/mj/submit/video", `{"prompt":"video"}`, "0.06", "mj_video", 30000, false},
+		{"describe URL needs no download", "/mj/submit/describe", fmt.Sprintf(`{"base64Array":[%q]}`, upstream.URL+"/image"), "0.06", "mj_describe", 30000, false},
+		{"blend", "/mj/submit/blend", `{"base64Array":["a","b"]}`, "0.06", "mj_blend", 30000, false},
+		{"edits", "/mj/submit/edits", `{"prompt":"edit"}`, "0.06", "mj_edits", 30000, false},
+		{"shorten", "/mj/submit/shorten", `{"prompt":"long prompt"}`, "0.06", "mj_shorten", 30000, false},
+		{"reroll", "/mj/submit/simple-change", `{"content":"owned r"}`, "0.06", "mj_reroll", 30000, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := quote(t, "POST", tc.path, tc.body)
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var result struct {
+				Quota         int
+				Amount, Model string
+				Channel       struct{ Id, Type int }
+			}
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &result))
+			assert.Equal(t, tc.quota, result.Quota)
+			assert.Equal(t, tc.amount, result.Amount)
+			assert.Equal(t, tc.model, result.Model)
+			expectedChannel := channel
+			if tc.origin {
+				expectedChannel = originChannel
+			}
+			assert.Equal(t, expectedChannel.Id, result.Channel.Id)
+			assert.Equal(t, expectedChannel.Type, result.Channel.Type)
+		})
+	}
+	for _, tc := range []struct {
+		name, method, path, body string
+		status                   int
+	}{
+		{"missing prompt", "POST", "/mj/submit/imagine", `{}`, 400},
+		{"missing swap source", "POST", "/mj/insight-face/swap", `{"targetBase64":"x"}`, 400},
+		{"missing origin", "POST", "/mj/submit/change", `{"action":"UPSCALE","index":1}`, 400},
+		{"unknown origin", "POST", "/mj/submit/modal", `{"taskId":"absent"}`, 400},
+		{"foreign origin", "POST", "/mj/submit/modal", `{"taskId":"foreign","user_id":1,"metadata":{"taskId":"owned"}}`, 400},
+		{"pending origin", "POST", "/mj/submit/change", `{"taskId":"pending","action":"UPSCALE","index":1}`, 400},
+		{"missing index", "POST", "/mj/submit/change", `{"taskId":"owned","action":"UPSCALE"}`, 400},
+		{"negative index", "POST", "/mj/submit/change", `{"taskId":"owned","action":"UPSCALE","index":-1}`, 400},
+		{"malformed plus action", "POST", "/mj/submit/action", `{"taskId":"owned","customId":"MJ"}`, 400},
+		{"missing plus index", "POST", "/mj/submit/action", `{"taskId":"owned","customId":"MJ::JOB::upsample"}`, 400},
+		{"unknown variation cannot retain injected action", "POST", "/mj/submit/action", `{"taskId":"owned","customId":"MJ::JOB::unknown_variation::1","action":"INPAINT"}`, 400},
+		{"malformed simple action", "POST", "/mj/submit/simple-change", `{"content":"owned u"}`, 400},
+		{"empty simple action", "POST", "/mj/submit/simple-change", `{"content":"owned "}`, 400},
+		{"upload", "POST", "/mj/submit/upload-discord-images", `{}`, 422},
+		{"fetch", "GET", "/mj/task/owned/fetch", `{}`, 422},
+		{"image seed", "GET", "/mj/task/owned/image-seed", `{}`, 422},
+		{"image download", "GET", "/mj/image/owned", `{}`, 422},
+		{"list", "POST", "/mj/task/list-by-condition", `{}`, 422},
+		{"callback", "POST", "/mj/notify", `{}`, 422},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := quote(t, tc.method, tc.path, tc.body)
+			assert.Equal(t, tc.status, w.Code, w.Body.String())
+		})
+	}
+	t.Run("origin channel remains subject to token permissions", func(t *testing.T) {
+		require.NoError(t, model.DB.Model(&token).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "mj_imagine"}).Error)
+		w := quote(t, "POST", "/mj/submit/change", `{"taskId":"owned","action":"UPSCALE","index":1}`)
+		assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+		require.NoError(t, model.DB.Model(&token).Updates(map[string]any{"model_limits_enabled": false, "model_limits": ""}).Error)
+	})
+	t.Run("origin channel preserves group model availability", func(t *testing.T) {
+		require.NoError(t, model.DB.Model(&model.Ability{}).Where("model = ?", "mj_upscale").Update("enabled", false).Error)
+		w := quote(t, "POST", "/mj/submit/change", `{"taskId":"owned","action":"UPSCALE","index":1}`)
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+		require.NoError(t, model.DB.Model(&model.Ability{}).Where("model = ?", "mj_upscale").Update("enabled", true).Error)
+	})
+	t.Run("origin channel must still exist and be enabled", func(t *testing.T) {
+		require.NoError(t, model.DB.Model(&originChannel).Update("status", common.ChannelStatusManuallyDisabled).Error)
+		w := quote(t, "POST", "/mj/submit/modal", `{"taskId":"owned"}`)
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		require.NoError(t, model.DB.Model(&originChannel).Update("status", common.ChannelStatusEnabled).Error)
+		for _, id := range []int{0, originChannel.Id + 1000} {
+			require.NoError(t, model.DB.Model(&model.Midjourney{}).Where("mj_id = ?", "owned").Update("channel_id", id).Error)
+			w = quote(t, "POST", "/mj/submit/modal", `{"taskId":"owned"}`)
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		}
+		require.NoError(t, model.DB.Model(&model.Midjourney{}).Where("mj_id = ?", "owned").Update("channel_id", originChannel.Id).Error)
+	})
+	t.Run("pricing failure does not mutate selected channel", func(t *testing.T) {
+		prices := ratio_setting.ModelPrice2JSONString()
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"mj_imagine":-1}`))
+		w := quote(t, "POST", "/mj/submit/imagine", `{"prompt":"cat"}`)
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.NotContains(t, w.Body.String(), `"amount"`)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(prices))
+	})
+	t.Run("real submissions keep charging and post-submit rejection behavior", func(t *testing.T) {
+		savedGroups := setting.UserUsableGroups2JSONString()
+		t.Cleanup(func() { require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(savedGroups)) })
+		require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default","vip":"VIP","auto":"Auto"}`))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1.5,"vip":2,"auto":3}`))
+		require.NoError(t, model.DB.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).Update("group", "vip").Error)
+		token.Group, token.AutoGroups = "auto", `["vip","default"]`
+		require.NoError(t, model.DB.Save(&token).Error)
+		w := quote(t, "POST", "/mj/submit/change", `{"taskId":"owned","action":"UPSCALE","index":1}`)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assert.JSONEq(t, fmt.Sprintf(`{"quota":40000,"amount":"0.08","currency":"USD","model":"mj_upscale","group":"vip","channel":{"id":%d,"type":%d}}`, originChannel.Id, originChannel.Type), w.Body.String())
+		service.InitHttpClient()
+		require.NoError(t, model.DB.Model(&user).Update("quota", 1000000).Error)
+		require.NoError(t, model.DB.Model(&token).Updates(map[string]any{"status": common.TokenStatusEnabled, "remain_quota": 1000000}).Error)
+		for _, tc := range []struct {
+			path, body             string
+			code, quota, channelID int
+		}{
+			{"/mj/submit/imagine", `{"prompt":"cat"}`, 1, 10000, channel.Id},
+			{"/mj/insight-face/swap", `{"sourceBase64":"x","targetBase64":"y"}`, 1, 20000, channel.Id},
+			{"/fast/mj/submit/simple-change", `{"content":"owned u2"}`, 22, 40000, originChannel.Id},
+			{"/mj/submit/action", `{"taskId":"owned","customId":"MJ::Inpaint::job"}`, 1, 0, originChannel.Id},
+			{"/mj/submit/imagine", `{"prompt":"rejected"}`, 24, 0, channel.Id},
+		} {
+			submitResult.Store(int32(tc.code))
+			var beforeUser model.User
+			var beforeToken model.Token
+			require.NoError(t, model.DB.First(&beforeUser, user.Id).Error)
+			require.NoError(t, model.DB.First(&beforeToken, token.Id).Error)
+			r := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			r.Header.Set("Authorization", "Bearer "+token.Key)
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, r)
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			task := model.GetByMJId(user.Id, fmt.Sprintf("submitted-%d", calls.Load()))
+			require.NotNil(t, task, w.Body.String())
+			assert.Equal(t, tc.quota, task.Quota)
+			assert.Equal(t, tc.channelID, task.ChannelId)
+			var afterUser model.User
+			var afterToken model.Token
+			require.NoError(t, model.DB.First(&afterUser, user.Id).Error)
+			require.NoError(t, model.DB.First(&afterToken, token.Id).Error)
+			assert.Equal(t, beforeUser.Quota-tc.quota, afterUser.Quota)
+			assert.Equal(t, beforeToken.RemainQuota-tc.quota, afterToken.RemainQuota)
+		}
+		assert.EqualValues(t, 5, calls.Load())
+	})
 }
 
 func TestRequestEstimateContract(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -312,9 +313,24 @@ func selectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				FilterKind: kind, Channel: channel,
 			}
 		}
+		// Legacy MJ originally selected its billing group before rebinding to
+		// the origin channel. Keep that routing context for derived actions.
+		if pin.Source == dto.PinSourceOriginTask && strings.Contains(retry.RequestPath, "/mj/") {
+			_, group, selectErr := selectUnpinnedChannelForRequest(c, modelName, retry, estimate)
+			if selectErr != nil {
+				return nil, group, selectErr
+			}
+			return channel, group, nil
+		}
 		return channel, "", nil
 	}
+	return selectUnpinnedChannelForRequest(c, modelName, retry, estimate)
+}
 
+// Group resolution and affinity follow the ordinary routing rules, even
+// when a legacy derived action ultimately submits on its origin channel.
+func selectUnpinnedChannelForRequest(c *gin.Context, modelName string, retry *RetryParam, estimate bool) (*model.Channel, string, *ChannelSelectError) {
+	constraints := GetChannelConstraints(c)
 	usingGroup := retry.TokenGroup
 	var channel *model.Channel
 	var selectGroup string

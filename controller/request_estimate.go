@@ -22,6 +22,10 @@ import (
 
 // RequestEstimate stops at nominal pricing and never starts an upstream attempt.
 func RequestEstimate(c *gin.Context, relayFormat types.RelayFormat) {
+	if relayFormat == types.RelayFormatMjProxy {
+		requestEstimateMidjourney(c)
+		return
+	}
 	_, pinnedEndpoint := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
 	_, pinnedRoute := c.Get(pluginruntime.ContextKeyPinnedRoute)
 	if relayFormat == types.RelayFormatTask || pinnedEndpoint || pinnedRoute {
@@ -86,6 +90,34 @@ func RequestEstimate(c *gin.Context, relayFormat types.RelayFormat) {
 		"quota":    quota,
 		"amount":   decimal.NewFromInt(int64(quota)).Div(decimal.NewFromFloat(common.QuotaPerUnit)).String(),
 		"currency": "USD", "model": info.GetBillingModelName(), "group": info.UsingGroup,
+		"channel": gin.H{"id": c.GetInt("channel_id"), "type": c.GetInt("channel_type")},
+	})
+}
+
+func requestEstimateMidjourney(c *gin.Context) {
+	info, err := relaycommon.GenRelayInfo(c, types.RelayFormatMjProxy, nil, nil)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimateInvalidRequest), "type": "invalid_request_error", "code": "invalid_request"}})
+		return
+	}
+	prepared, mjErr := service.PrepareMidjourneySubmit(c, info.UserId, info.RelayMode)
+	if mjErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimateInvalidRequest), "type": "invalid_request_error", "code": "invalid_request"}})
+		return
+	}
+	info.InitChannelMeta(c)
+	price, err := helper.ModelPriceHelperPerCall(c, info)
+	if err != nil || price.Quota < 0 || common.QuotaPerUnit <= 0 || math.IsNaN(common.QuotaPerUnit) || math.IsInf(common.QuotaPerUnit, 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": "estimate_pricing_failed"}})
+		return
+	}
+	quota := price.Quota
+	if !prepared.ConsumeQuota {
+		quota = 0
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"quota": quota, "amount": decimal.NewFromInt(int64(quota)).Div(decimal.NewFromFloat(common.QuotaPerUnit)).String(),
+		"currency": "USD", "model": prepared.ModelName, "group": info.UsingGroup,
 		"channel": gin.H{"id": c.GetInt("channel_id"), "type": c.GetInt("channel_type")},
 	})
 }
