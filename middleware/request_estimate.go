@@ -24,7 +24,7 @@ import (
 
 // EstimateTarget restores a target request after the outer credential has been checked.
 // resolveTarget matches against the real relay route registrations.
-func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFormat, bool)) gin.HandlerFunc {
+func EstimateTarget(resolveTarget func(method, targetPath string, generation *pluginruntime.RoutingGeneration) (types.RelayFormat, bool)) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		var envelope struct {
@@ -64,11 +64,13 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
 			return
 		}
-		relayFormat, supported := resolveTarget(envelope.Method, target.Path)
+		generation := pluginruntime.DefaultRegistry.Generation()
+		relayFormat, supported := resolveTarget(envelope.Method, target.Path, generation)
 		if !supported {
 			abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
 			return
 		}
+		c.Set(requestEstimateGenerationKey, generation)
 		taskPluginKey := ""
 		if relayFormat == types.RelayFormatTask {
 			parts := strings.Split(strings.Trim(target.Path, "/"), "/")
@@ -77,17 +79,14 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			} else if len(parts) == 4 && parts[0] == "v1" && parts[1] == "videos" && parts[3] == "remix" {
 				c.Params = append(c.Params, gin.Param{Key: "video_id", Value: parts[2]})
 			} else {
-				generation := pluginruntime.DefaultRegistry.Generation()
 				route, params, nativeRoute := generation.LookupDeclaredRequestRouteParams(envelope.Method, target.Path)
 				_, _, protocolOperation := pluginruntime.LookupHostProtocolOperation(envelope.Method, target.Path)
 				if nativeRoute {
 					c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Generation: generation, Plugin: route.Plugin, Route: route.Route})
 					c.Set(requestEstimateNativeParamsKey, params)
 					c.Set(requestEstimatePluginTargetKey, true)
-					c.Set(requestEstimateGenerationKey, generation)
 				} else if protocolOperation {
 					c.Set(requestEstimatePluginTargetKey, true)
-					c.Set(requestEstimateGenerationKey, generation)
 				} else {
 					abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
 					return
@@ -218,7 +217,6 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 		c.Set("estimate_relay_format", relayFormat)
 		c.Set("request_estimate", true)
 		if taskPluginKey != "" {
-			generation := pluginruntime.DefaultRegistry.Generation()
 			plugin, exists := generation.Get(taskPluginKey)
 			if !exists {
 				abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
@@ -232,10 +230,8 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			c.Set("platform", taskPluginKey)
 		}
 		if relayFormat != types.RelayFormatTask {
-			generation := pluginruntime.DefaultRegistry.Generation()
 			if _, _, protocolOperation := pluginruntime.LookupHostProtocolOperation(envelope.Method, target.Path); protocolOperation {
 				c.Set(requestEstimatePluginTargetKey, true)
-				c.Set(requestEstimateGenerationKey, generation)
 			}
 		}
 		if len(mediaInfo) > 0 {

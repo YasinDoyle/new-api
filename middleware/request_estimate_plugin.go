@@ -42,7 +42,7 @@ func prepareRequestEstimateRemix(c *gin.Context) (string, error) {
 	if modelName == "" {
 		return "", errors.New("origin task model is unavailable")
 	}
-	generation := pluginruntime.DefaultRegistry.Generation()
+	generation, _ := c.MustGet(requestEstimateGenerationKey).(*pluginruntime.RoutingGeneration)
 	plugin, ok := generation.Get(string(origin.Platform))
 	if !ok {
 		for _, candidate := range generation.Plugins() {

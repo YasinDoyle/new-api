@@ -68,7 +68,7 @@ func registerRequestEstimateTaskRoute(method, path string) {
 	requestEstimateRouteFormat[key] = types.RelayFormatTask
 }
 
-func resolveRequestEstimateRoute(method, path string) (types.RelayFormat, bool) {
+func resolveRequestEstimateRoute(method, path string, generation *pluginruntime.RoutingGeneration) (types.RelayFormat, bool) {
 	requestEstimateRouteMu.RLock()
 	if requestEstimateRouter == nil || isGeminiCountTokensPath(path) {
 		requestEstimateRouteMu.RUnlock()
@@ -82,7 +82,6 @@ func resolveRequestEstimateRoute(method, path string) (types.RelayFormat, bool) 
 	if relayFormat != "" {
 		return relayFormat, true
 	}
-	generation := pluginruntime.DefaultRegistry.Generation()
 	if _, found := generation.LookupDeclaredRequestRoute(method, path); found {
 		return types.RelayFormatTask, true
 	}

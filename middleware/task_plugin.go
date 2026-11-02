@@ -439,6 +439,11 @@ func lookupTaskPluginEndpoint(generation *pluginruntime.RoutingGeneration, metho
 func PinTaskPluginEndpoint() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		generation := pluginruntime.DefaultRegistry.Generation()
+		if value, exists := c.Get(requestEstimateGenerationKey); exists {
+			if pinned, ok := value.(*pluginruntime.RoutingGeneration); ok {
+				generation = pinned
+			}
+		}
 		if value, exists := c.Get(contextKeyTaskPluginEndpointSelection); exists {
 			if selected, ok := value.(taskPluginEndpointSelection); ok {
 				generation = selected.Generation

@@ -27,12 +27,14 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
@@ -1448,26 +1450,38 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 	require.NoError(t, config.GlobalConfig.SaveToDB(func(k, v string) error { savedConfig[k] = v; return nil }))
 	savedPrices := ratio_setting.ModelPrice2JSONString()
 	savedRegistry := pluginruntime.DefaultRegistry
+	savedGroup := ratio_setting.GroupRatio2JSONString()
+	savedGroupGroup := ratio_setting.GroupGroupRatio2JSONString()
+	savedMemory, savedQuotaUnit := common.MemoryCacheEnabled, common.QuotaPerUnit
+	common.MemoryCacheEnabled, common.QuotaPerUnit = true, 500000
 	t.Cleanup(func() {
+		common.MemoryCacheEnabled, common.QuotaPerUnit = savedMemory, savedQuotaUnit
 		pluginruntime.DefaultRegistry = savedRegistry
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(savedGroup))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(savedGroupGroup))
 		require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig))
 		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices))
 	})
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{}`))
 
 	registry := pluginruntime.NewRegistry()
-	plugin, err := registry.Register(`
+	var publishDuringHook func()
+	source := `
 		export const meta = {
 		  apiVersion: 1, key: "estimate-dynamic-routes", name: "Estimate dynamic routes", version: "1.0.0",
 		  author: {name: "Test"}, models: ["dynamic-route-model"], fetchMode: "per_task",
-		  usageSchema: {seconds: {type: "number", unit: "second"}},
+		  usageSchema: {seconds: {type: "number", unit: "second", description: {en: "Video generation unit price", zh: "视频生成单价"}}},
 		  routes: [
 		    {method: "POST", path: "/estimate-native/jobs/:task_id", type: "submit", action: "create", decode: "decodeNative", render: "renderNative"},
-		    {method: "PUT", path: "/estimate-native/jobs/:task_id", type: "submit", action: "create", decode: "decodeNative", render: "renderNative"}
+		    {method: "PUT", path: "/estimate-native/jobs/:task_id", type: "submit", action: "create", decode: "decodeNative", render: "renderNative"},
+		    {method: "GET", path: "/estimate-native/jobs/:task_id", type: "query", render: "renderNative"}
 		  ],
 		  protocols: [{name: "openai_responses", supports: ["stream", "sync", "background"]}, "openai_image", "openai_video"]
 		};
 		export const native = {
 		  decodeNative(ctx) {
+		    console.log("generation-checkpoint");
 		    if (ctx.path !== "/estimate-native/jobs/task-7" || ctx.params.task_id !== "task-7" || ctx.query.action[0] !== "extend" || !["POST", "PUT"].includes(ctx.method)) throw new Error("native request context was not preserved");
 		    if (ctx.body.kind === "multipart") return {kind:"submit", model:ctx.body.fields.model[0], action:"extend", requestBody:{file:ctx.body.files[1].ref}};
 		    const intent = {kind: "submit", model: ctx.body.value.model, action: ctx.query.action[0], requestBody: {seconds: ctx.body.value.seconds}};
@@ -1480,12 +1494,20 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 		  renderNative(ctx, task) { return task; }
 		};
 		export const protocols = {
-		  openai_image: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: ctx.body.value.seconds}}; }, render(ctx, task) { return {data: []}; }},
-		  openai_video: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: ctx.body.value.seconds}}; }, render(ctx, task) { return task.data; }},
-		  openai_responses: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: ctx.body.value.seconds}}; }, renderEvents() { return {events: [], state: null, done: false}; }, renderFinal(ctx, task) { return task.data; }}
+		  openai_image: {decodeRequest: decodeHost, render() { throw new Error("estimate called image presenter"); }},
+		  openai_video: {decodeRequest: decodeHost, render() { throw new Error("estimate called video presenter"); }},
+		  openai_responses: {decodeRequest: decodeHost, renderEvents() { throw new Error("estimate started streaming"); }, renderFinal() { throw new Error("estimate called Responses presenter"); }}
 		};
+		function decodeHost(ctx) {
+		  console.log("generation-checkpoint");
+		  if (ctx.body.value.ordinaryOnly) throw new Error("ordinary relay request entered plugin decoder");
+		  return {kind: "submit", model: ctx.model, action: ctx.body.value.action, requestBody: {seconds: ctx.body.value.seconds}};
+		}
 		export function buildSubmitRequest(ctx) {
+		  console.log("generation-checkpoint");
 		  if (ctx.mediaInfo !== undefined) throw new Error("media facts leaked to submit preparation");
+		  if (ctx.requestHeaders["X-Estimate-Protocol"] !== "test-v1") throw new Error("protocol header was not preserved");
+		  if (!ctx.requestBody.model && ctx.requestBody.seconds && ctx.action !== "extend") throw new Error("decoded submit action was not preserved");
 		  if (ctx.requestBody.requiresOrigin && (!ctx.originTasks || ctx.originTasks[0].upstreamTaskId !== "private-origin-id")) throw new Error("origin task was not resolved");
 		  if (ctx.requestBody.requiresOrigin && ctx.originTasks[0].status !== "SUCCESS") throw new Error("extend requires a successful origin task");
 		  return {url: ctx.baseUrl + "/submit", method: "POST", body: ctx.requestBody};
@@ -1496,14 +1518,22 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 		    if (ctx.requestBody.file !== "request_file:audio#1" || ctx.mediaInfo[0].field !== "audio" || ctx.mediaInfo[0].index !== 1) throw new Error("file binding was lost");
 		    return {seconds: ctx.mediaInfo[0].durationSeconds};
 		  }
+		  if (ctx.upstreamModel === "dynamic-route-mapped") return {seconds: ctx.requestBody.seconds * 2};
 		  return {seconds: ctx.requestBody.seconds};
 		}
-		export function listArtifacts() { return []; }
-		export function buildContentRequest() { return {}; }
-		export function parseSubmitResponse() { return {taskId: "unused"}; }
-		export function buildQueryRequest() { return {}; }
-		export function parseTaskResult() { return {status: "SUCCESS"}; }
-	`, pluginruntime.Options{})
+		export function listArtifacts() { throw new Error("estimate listed artifacts"); }
+		export function buildContentRequest() { throw new Error("estimate downloaded content"); }
+		export function parseSubmitResponse() { throw new Error("estimate submitted upstream"); }
+		export function buildQueryRequest() { throw new Error("estimate started polling"); }
+		export function parseTaskResult() { throw new Error("estimate polled upstream"); }
+	`
+	plugin, err := registry.Register(source, pluginruntime.Options{Log: func(message string) {
+		if strings.Contains(message, "generation-checkpoint") && publishDuringHook != nil {
+			publish := publishDuringHook
+			publishDuringHook = nil
+			publish()
+		}
+	}})
 	require.NoError(t, err)
 	require.NoError(t, registry.ReplaceOverrides(nil))
 	pluginruntime.DefaultRegistry = registry
@@ -1532,10 +1562,11 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 	SetRelayRouter(engine)
 	SetTaskRouter(engine)
 	SetTaskPluginProtocolRouter(engine)
+	engine.NoRoute(SetPluginRouter(engine))
 	require.NoError(t, registry.ReplaceOverrides([]*pluginruntime.LoadedPlugin{plugin}))
 	quoteMethodWithBody := func(method, path, body string) *httptest.ResponseRecorder {
 		before := requestEstimateBusinessSnapshot(t)
-		payload, marshalErr := common.Marshal(map[string]any{"method": method, "path": path, "body": common.RawMessage(body)})
+		payload, marshalErr := common.Marshal(map[string]any{"method": method, "path": path, "headers": http.Header{"X-Estimate-Protocol": {"test-v1"}}, "body": common.RawMessage(body)})
 		require.NoError(t, marshalErr)
 		request := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(payload))
 		request.Header.Set("Authorization", "Bearer "+token.Key)
@@ -1543,17 +1574,66 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 		response := httptest.NewRecorder()
 		engine.ServeHTTP(response, request)
 		assert.Equal(t, before, requestEstimateBusinessSnapshot(t))
+		for _, secret := range []string{"dynamic-route-secret", "ordinary-secret", upstream.URL, "private-origin-id"} {
+			assert.NotContains(t, response.Body.String(), secret)
+		}
 		return response
 	}
 	quoteWithBody := func(path, body string) *httptest.ResponseRecorder {
 		return quoteMethodWithBody(http.MethodPost, path, body)
 	}
 	quote := func(path string) *httptest.ResponseRecorder {
-		return quoteWithBody(path, `{"model":"dynamic-route-model","seconds":2}`)
+		return quoteWithBody(path, `{"model":"dynamic-route-model","seconds":2,"action":"extend"}`)
 	}
+	t.Run("shared host model follows published channel selection", func(t *testing.T) {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+			"billing_setting.billing_mode": `{"dynamic-route-model":"tiered_expr"}`,
+			"billing_setting.billing_expr": `{"dynamic-route-model":"tier(\"request\", fixed(0.03))"}`,
+		}))
+		priority := int64(10)
+		ordinary := model.Channel{Type: constant.ChannelTypeOpenAI, Key: "ordinary-secret", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "dynamic-route-model", Group: "default", Priority: &priority}
+		require.NoError(t, ordinary.Insert())
+		model.InitChannelCache()
+		for _, enabled := range []bool{true, false, true} {
+			ordinary.Status = common.ChannelStatusManuallyDisabled
+			if enabled {
+				ordinary.Status = common.ChannelStatusEnabled
+			}
+			require.NoError(t, ordinary.Update())
+			model.InitChannelCache()
+			for _, path := range []string{"/v1/responses", "/v1/images/generations"} {
+				response := quoteWithBody(path, fmt.Sprintf(`{"model":"dynamic-route-model","seconds":2,"action":"extend","input":"test","prompt":"test","n":1,"ordinaryOnly":%t}`, enabled))
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				var result map[string]any
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+				selected := result["channel"].(map[string]any)
+				if enabled {
+					assert.EqualValues(t, ordinary.Id, selected["id"])
+					assert.NotContains(t, selected, "plugin")
+					assert.Equal(t, "0.03", result["amount"])
+					assert.EqualValues(t, 15000, result["quota"])
+				} else {
+					assert.EqualValues(t, channel.Id, selected["id"])
+					assert.Equal(t, plugin.Meta.Key, selected["plugin"])
+					assert.Equal(t, "0.4", result["amount"])
+					assert.EqualValues(t, 200000, result["quota"])
+				}
+			}
+		}
+		require.NoError(t, ordinary.Delete())
+		model.InitChannelCache()
+		response := quote("/v1/responses")
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		var result map[string]any
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.EqualValues(t, channel.Id, result["channel"].(map[string]any)["id"])
+		assert.Equal(t, "0.4", result["amount"])
+	})
 	for _, target := range []string{
+		"/v1/tasks/estimate-dynamic-routes",
 		"/estimate-native/jobs/task-7?action=extend",
 		"/v1/images/generations",
+		"/v1/images/edits",
 		"/v1/videos",
 		"/v1/responses",
 	} {
@@ -1565,12 +1645,18 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 		assert.Equal(t, "0.4", result["amount"])
 		assert.Equal(t, plugin.Meta.Key, result["channel"].(map[string]any)["plugin"])
 	}
-	streamingResponse := quoteWithBody("/v1/responses", `{"model":"dynamic-route-model","seconds":2,"stream":true}`)
+	streamingResponse := quoteWithBody("/v1/responses", `{"model":"dynamic-route-model","seconds":2,"action":"extend","stream":true}`)
 	require.Equal(t, http.StatusOK, streamingResponse.Code, streamingResponse.Body.String())
 	assert.Equal(t, "application/json; charset=utf-8", streamingResponse.Header().Get("Content-Type"))
 	var streamingResult map[string]any
 	require.NoError(t, common.Unmarshal(streamingResponse.Body.Bytes(), &streamingResult))
 	assert.Equal(t, float64(200000), streamingResult["quota"])
+	backgroundResponse := quoteWithBody("/v1/responses", `{"model":"dynamic-route-model","seconds":2,"action":"extend","background":true}`)
+	require.Equal(t, http.StatusOK, backgroundResponse.Code, backgroundResponse.Body.String())
+	var backgroundResult map[string]any
+	require.NoError(t, common.Unmarshal(backgroundResponse.Body.Bytes(), &backgroundResult))
+	assert.Equal(t, "0.4", backgroundResult["amount"])
+	assert.EqualValues(t, 200000, backgroundResult["quota"])
 	putQuote := quoteMethodWithBody(http.MethodPut, "/estimate-native/jobs/task-7?action=extend", `{"model":"dynamic-route-model","seconds":2}`)
 	require.Equal(t, http.StatusOK, putQuote.Code, putQuote.Body.String())
 	t.Run("multipart facts bind to the actual repeated file", func(t *testing.T) {
@@ -1592,7 +1678,7 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 			before := requestEstimateBusinessSnapshot(t)
 			payload, err := common.Marshal(map[string]any{
 				"method": http.MethodPost, "path": "/estimate-native/jobs/task-7?action=extend",
-				"headers": http.Header{"Content-Type": {writer.FormDataContentType()}}, "body_base64": base64.StdEncoding.EncodeToString(body.Bytes()),
+				"headers": http.Header{"Content-Type": {writer.FormDataContentType()}, "X-Estimate-Protocol": {"test-v1"}}, "body_base64": base64.StdEncoding.EncodeToString(body.Bytes()),
 				"media_info": []map[string]any{{"field": scenario.field, "index": scenario.index, "type": "audio", "duration_seconds": 4}},
 			})
 			require.NoError(t, err)
@@ -1651,41 +1737,140 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 		require.NoError(t, model.DB.Model(&channel).Update("status", common.ChannelStatusEnabled).Error)
 		model.InitChannelCache()
 	})
-	replacement, err := registry.Register(`
-		export const meta = {
-		  apiVersion: 1, key: "estimate-dynamic-routes", name: "Estimate dynamic routes", version: "2.0.0",
-		  author: {name: "Test"}, models: ["dynamic-route-model"], fetchMode: "per_task",
-		  usageSchema: {seconds: {type: "number", unit: "second"}},
-		  routes: [
-		    {method: "POST", path: "/estimate-native/jobs/:task_id", type: "submit", action: "create", decode: "decodeNative", render: "renderNative"},
-		    {method: "PUT", path: "/estimate-native/jobs/:task_id", type: "submit", action: "create", decode: "decodeNative", render: "renderNative"}
-		  ],
-		  protocols: [{name: "openai_responses", supports: ["stream", "sync", "background"]}, "openai_image", "openai_video"]
-		};
-		export const native = {decodeNative(ctx) { return {kind: "submit", model: ctx.body.value.model, requestBody: {seconds: 1}}; }, renderNative(ctx, task) { return task; }};
-		export const protocols = {
-		  openai_image: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: 1}}; }, render(ctx, task) { return {data: []}; }},
-		  openai_video: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: 1}}; }, render(ctx, task) { return task.data; }},
-		  openai_responses: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: 1}}; }, renderEvents() { return {events: [], state: null, done: false}; }, renderFinal(ctx, task) { return task.data; }}
-		};
-		export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/submit", method: "POST", body: ctx.requestBody}; }
-		export function extractUsage(ctx) { return {seconds: ctx.requestBody.seconds}; }
-		export function listArtifacts() { return []; }
-		export function buildContentRequest() { return {}; }
-		export function parseSubmitResponse() { return {taskId: "unused"}; }
-		export function buildQueryRequest() { return {}; }
-		export function parseTaskResult() { return {status: "SUCCESS"}; }
-	`, pluginruntime.Options{})
+	// Different decoder and usage changes make a mixed generation observable:
+	// v1 is 2 * $0.2 = $0.4; v2 is (2 + 1) * 3 * $0.2 = $1.8.
+	replacement, err := pluginruntime.CompilePlugin(strings.NewReplacer(
+		`version: "1.0.0"`, `version: "2.0.0"`,
+		`seconds: ctx.body.value.seconds`, `seconds: ctx.body.value.seconds + 1`,
+		`seconds: ctx.requestBody.seconds`, `seconds: ctx.requestBody.seconds * 3`,
+	).Replace(source), pluginruntime.Options{})
 	require.NoError(t, err)
-	require.NoError(t, registry.ReplaceOverrides([]*pluginruntime.LoadedPlugin{replacement}))
-	updated := quote("/estimate-native/jobs/task-7?action=extend")
-	require.Equal(t, http.StatusOK, updated.Code, updated.Body.String())
-	var updatedResult map[string]any
-	require.NoError(t, common.Unmarshal(updated.Body.Bytes(), &updatedResult))
-	assert.Equal(t, float64(100000), updatedResult["quota"], "the next request must use the replacement generation")
-	require.NoError(t, registry.ReplaceOverrides(nil))
-	removed := quote("/estimate-native/jobs/task-7?action=extend")
-	assert.Equal(t, http.StatusUnprocessableEntity, removed.Code, removed.Body.String())
+	t.Run("target matching and preparation share one generation", func(t *testing.T) {
+		// The resolver is an existing middleware dependency. Publish after its
+		// real lookup to deterministically exercise the match/prepare boundary.
+		outer := engine
+		engine = gin.New()
+		t.Cleanup(func() { engine = outer })
+		engine.POST("/v1/requests/estimate", middleware.EstimateTokenAuth(), middleware.EstimateTarget(
+			func(method, path string, generation *pluginruntime.RoutingGeneration) (types.RelayFormat, bool) {
+				format, supported := resolveRequestEstimateRoute(method, path, generation)
+				require.NoError(t, registry.ReplaceOverrides(nil))
+				return format, supported
+			}), middleware.RouteTaskPluginEndpoint(), middleware.PrepareTaskPluginEndpoint(), middleware.PrepareRequestEstimateNativeRoute(), middleware.DistributeForEstimate(), func(c *gin.Context) {
+			format := c.MustGet("estimate_relay_format").(types.RelayFormat)
+			controller.RequestEstimate(c, format)
+		})
+		for _, path := range []string{"/estimate-native/jobs/task-7?action=extend", "/v1/tasks/estimate-dynamic-routes", "/v1/responses", "/v1/videos"} {
+			require.NoError(t, registry.ReplaceOverrides([]*pluginruntime.LoadedPlugin{plugin}))
+			response := quote(path)
+			require.Equal(t, http.StatusOK, response.Code, path+": "+response.Body.String())
+			var result map[string]any
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.Equal(t, "0.4", result["amount"])
+			assert.EqualValues(t, 200000, result["quota"])
+		}
+	})
+	t.Run("publication inside a real hook never mixes generations", func(t *testing.T) {
+		for _, path := range []string{"/estimate-native/jobs/task-7?action=extend", "/v1/responses", "/v1/images/generations", "/v1/videos", "/v1/tasks/estimate-dynamic-routes"} {
+			require.NoError(t, registry.ReplaceOverrides([]*pluginruntime.LoadedPlugin{plugin}))
+			var publishErr error
+			publishDuringHook = func() { publishErr = registry.ReplaceOverrides([]*pluginruntime.LoadedPlugin{replacement}) }
+			first := quote(path)
+			require.Nil(t, publishDuringHook, "the real JS hook must trigger publication")
+			require.NoError(t, publishErr)
+			for i, response := range []*httptest.ResponseRecorder{first, quote(path)} {
+				require.Equal(t, http.StatusOK, response.Code, path+": "+response.Body.String())
+				var result map[string]any
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+				amount, quota := "0.4", 200000
+				if i == 1 {
+					amount, quota = "1.8", 900000
+					if path == "/v1/tasks/estimate-dynamic-routes" {
+						// Generic requests are already normalized and have no decoder.
+						amount, quota = "1.2", 600000
+					}
+				}
+				assert.Equal(t, amount, result["amount"], path)
+				assert.EqualValues(t, quota, result["quota"], path)
+				assert.EqualValues(t, channel.Id, result["channel"].(map[string]any)["id"])
+			}
+		}
+	})
+	t.Run("uninstall and reinstall apply to the next request", func(t *testing.T) {
+		require.NoError(t, registry.ReplaceOverrides(nil))
+		for _, path := range []string{"/estimate-native/jobs/task-7?action=extend", "/v1/tasks/estimate-dynamic-routes", "/v1/responses", "/v1/images/generations", "/v1/videos"} {
+			removed := quote(path)
+			assert.NotEqual(t, http.StatusOK, removed.Code, path+": "+removed.Body.String())
+			assert.NotContains(t, removed.Body.String(), `"amount"`)
+		}
+		require.NoError(t, registry.ReplaceOverrides([]*pluginruntime.LoadedPlugin{plugin}))
+		for _, path := range []string{"/estimate-native/jobs/task-7?action=extend", "/v1/tasks/estimate-dynamic-routes", "/v1/responses", "/v1/images/generations", "/v1/videos"} {
+			response := quote(path)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var result map[string]any
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.Equal(t, "0.4", result["amount"])
+			assert.EqualValues(t, 200000, result["quota"])
+		}
+	})
+	t.Run("published channel configuration is used without restarting routes", func(t *testing.T) {
+		mapping := `{"dynamic-route-model":"dynamic-route-mapped"}`
+		channel.ModelMapping = &mapping
+		require.NoError(t, channel.Update())
+		model.InitChannelCache()
+		for _, path := range []string{"/estimate-native/jobs/task-7?action=extend", "/v1/tasks/estimate-dynamic-routes", "/v1/responses"} {
+			response := quote(path)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var result map[string]any
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.Equal(t, "0.8", result["amount"])
+			assert.EqualValues(t, 400000, result["quota"])
+			assert.Equal(t, "dynamic-route-model", result["model"])
+		}
+		channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "unrelated-plugin"})
+		require.NoError(t, channel.Update())
+		model.InitChannelCache()
+		unbound := quote("/estimate-native/jobs/task-7?action=extend")
+		assert.Equal(t, http.StatusServiceUnavailable, unbound.Code, unbound.Body.String())
+		assert.NotContains(t, unbound.Body.String(), `"amount"`)
+		require.NoError(t, channel.Delete())
+		model.InitChannelCache()
+		deleted := quote("/v1/tasks/estimate-dynamic-routes")
+		assert.Equal(t, http.StatusServiceUnavailable, deleted.Code, deleted.Body.String())
+		assert.NotContains(t, deleted.Body.String(), `"amount"`)
+		channel.Id, channel.ModelMapping = 0, nil
+		channel.SetSetting(dto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+		require.NoError(t, channel.Insert())
+		model.InitChannelCache()
+		response := quote("/v1/responses")
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		var result map[string]any
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.EqualValues(t, channel.Id, result["channel"].(map[string]any)["id"])
+		assert.Equal(t, "0.4", result["amount"])
+	})
+	t.Run("only submit operations are quotable and the estimate namespace is reserved", func(t *testing.T) {
+		for _, target := range []struct{ method, path string }{
+			{http.MethodGet, "/estimate-native/jobs/task-7"},
+			{http.MethodPost, "/estimate-native/callback"},
+			{http.MethodPost, "/estimate-native/upload"},
+			{http.MethodGet, "/v1/responses/response-7"},
+			{http.MethodGet, "/v1/videos/task-7"},
+			{http.MethodGet, "/v1/videos/task-7/content"},
+			{http.MethodHead, "/v1/videos/task-7/content"},
+		} {
+			response := quoteMethodWithBody(target.method, target.path, `{"model":"dynamic-route-model"}`)
+			assert.Equal(t, http.StatusUnprocessableEntity, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), `"amount"`)
+		}
+		_, err := registry.Register(strings.NewReplacer(
+			`key: "estimate-dynamic-routes"`, `key: "estimate-namespace-conflict"`,
+			`/estimate-native/jobs/:task_id`, `/v1/requests/estimate`,
+		).Replace(source), pluginruntime.Options{})
+		require.Error(t, err, "a plugin cannot claim the host estimate endpoint")
+		response := quote("/estimate-native/jobs/task-7?action=extend")
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	})
 	assert.Zero(t, providerCalls.Load(), "estimate must not submit to the provider")
 }
 
