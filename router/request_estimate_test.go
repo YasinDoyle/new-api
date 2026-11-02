@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
@@ -90,12 +91,15 @@ func TestRequestEstimateContract(t *testing.T) {
 	require.NoError(t, model.DB.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "contractkey", Status: common.TokenStatusExhausted, ExpiredTime: -1}
 	require.NoError(t, model.DB.Create(&token).Error)
-	channel := model.Channel{Type: constant.ChannelTypeOpenAI, Key: "secret-one\nsecret-two", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "estimate-chat", Group: "default", ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}
+	channel := model.Channel{Type: constant.ChannelTypeOpenAI, Key: "secret-one\nsecret-two", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "estimate-chat,deepseek-search,deepseek-fetch", Group: "default", ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}
 	require.NoError(t, model.DB.Create(&channel).Error)
-	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "estimate-chat", ChannelId: channel.Id, Enabled: true}).Error)
+	for _, modelName := range []string{"estimate-chat", "deepseek-search", "deepseek-fetch"} {
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: modelName, ChannelId: channel.Id, Enabled: true}).Error)
+	}
 	engine := gin.New()
 	require.NoError(t, engine.SetTrustedProxies(nil))
 	SetRelayRouter(engine)
+	SetTaskPluginProtocolRouter(engine)
 	body := `{"model":"estimate-chat","messages":[{"role":"user","content":"hello"}],"max_tokens":0}`
 	envelope := map[string]any{"method": "POST", "path": "/v1/chat/completions", "body": common.RawMessage(body)}
 	// Snapshot all persisted business state, including empty accounting tables.
@@ -176,6 +180,7 @@ func TestRequestEstimateContract(t *testing.T) {
 			{"bad query", "/v1/chat/completions?x=%GG", 400},
 			{"recursive", "/v1/requests/estimate", 422},
 			{"realtime", "/v1/realtime", 422},
+			{"unimplemented Gemini countTokens", "/v1beta/models/estimate-chat:countTokens", 422},
 			{"query", "/v1/models", 422},
 			{"full query", "/v1/chat/completions?x=a%2Fb&x=c&key=forged", 200},
 		} {
@@ -194,7 +199,7 @@ func TestRequestEstimateContract(t *testing.T) {
 		assert.Equal(t, 200, quote(token.Key).Code)
 		delete(envelope, "body_base64")
 		envelope["body"] = common.RawMessage(strings.Replace(body, `"max_tokens":0`, `"stream":true`, 1))
-		assert.Equal(t, 422, quote(token.Key).Code)
+		assert.Equal(t, 200, quote(token.Key).Code, "streaming targets return a single JSON estimate")
 		envelope["body"] = common.RawMessage(strings.Replace(body, `"max_tokens":0`, `"max_tokens":18446744073709551615`, 1))
 		assert.Equal(t, 400, quote(token.Key).Code)
 		envelope["body"] = common.RawMessage(body)
@@ -210,6 +215,97 @@ func TestRequestEstimateContract(t *testing.T) {
 		assert.Equal(t, 413, quote(token.Key).Code)
 		delete(envelope, "padding")
 		constant.MaxRequestBodyMB = savedMaxBody
+	})
+	t.Run("ordinary HTTP protocols and streaming", func(t *testing.T) {
+		constant.CountToken = false
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"estimate-chat":0.01,"deepseek-search":0.01,"deepseek-fetch":0.01}`))
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{}`))
+		cases := []struct {
+			name, path, body string
+			headers          http.Header
+		}{
+			{"completion", "/v1/completions", `{"model":"estimate-chat","prompt":"hello"}`, nil},
+			{"messages", "/v1/messages", `{"model":"estimate-chat","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, http.Header{"Anthropic-Version": {"2023-06-01"}}},
+			{"responses", "/v1/responses", `{"model":"estimate-chat","input":"hello","stream":true}`, nil},
+			{"responses compact", "/v1/responses/compact", `{"model":"estimate-chat","input":"hello"}`, nil},
+			{"embedding", "/v1/embeddings", `{"model":"estimate-chat","input":"hello"}`, nil},
+			{"rerank", "/v1/rerank", `{"model":"estimate-chat","query":"hello","documents":["world"]}`, nil},
+			{"alpha search", "/v1/alpha/search", `{"model":"estimate-chat"}`, nil},
+			{"tool search", "/v1/tools/search", `{"model":"estimate-chat"}`, nil},
+			{"tool fetch", "/v1/tools/fetch", `{"model":"estimate-chat"}`, nil},
+			{"gemini generate", "/v1beta/models/estimate-chat:generateContent", `{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`, nil},
+			{"gemini streaming", "/v1beta/models/estimate-chat:streamGenerateContent?alt=sse", `{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`, nil},
+			{"gemini embedding", "/v1beta/models/estimate-chat:embedContent", `{"content":{"parts":[{"text":"hello"}]}}`, nil},
+			{"gemini batch embedding", "/v1beta/models/estimate-chat:batchEmbedContents", `{"requests":[{"model":"estimate-chat","content":{"parts":[{"text":"hello"}]}}]}`, nil},
+			{"streaming chat", "/v1/chat/completions", `{"model":"estimate-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`, nil},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				envelope["method"], envelope["path"] = http.MethodPost, tc.path
+				envelope["body"], envelope["headers"] = common.RawMessage(tc.body), tc.headers
+				w := quote(token.Key)
+				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+				var result map[string]any
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &result))
+				assert.Equal(t, float64(5000), result["quota"])
+				assert.Equal(t, "0.01", result["amount"])
+			})
+		}
+		for _, tc := range []struct {
+			name, path, body string
+			headers          http.Header
+		}{
+			{"messages max_tokens", "/v1/messages", `{"model":"estimate-chat","max_tokens":18446744073709551615,"messages":[{"role":"user","content":"hello"}]}`, nil},
+			{"responses max_output_tokens", "/v1/responses", `{"model":"estimate-chat","input":"hello","max_output_tokens":18446744073709551615}`, nil},
+			{"gemini maxOutputTokens", "/v1beta/models/estimate-chat:generateContent", `{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generationConfig":{"maxOutputTokens":18446744073709551615}}`, nil},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				envelope["method"], envelope["path"] = http.MethodPost, tc.path
+				envelope["body"], envelope["headers"] = common.RawMessage(tc.body), tc.headers
+				assert.Equal(t, http.StatusBadRequest, quote(token.Key).Code)
+			})
+		}
+		for _, tc := range []struct {
+			name, path, body string
+		}{
+			{"responses image input", "/v1/responses", `{"model":"estimate-chat","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.invalid/image.png"}]}]}`},
+			{"messages image input", "/v1/messages", `{"model":"estimate-chat","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.invalid/image.png"}}]}]}`},
+			{"gemini inline image", "/v1beta/models/estimate-chat:generateContent", `{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}}]}]}`},
+			{"gemini file input", "/v1beta/models/estimate-chat:embedContent", `{"content":{"parts":[{"fileData":{"mimeType":"text/plain","fileUri":"https://example.invalid/input.txt"}}]}}`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				envelope["method"], envelope["path"] = http.MethodPost, tc.path
+				envelope["body"], envelope["headers"] = common.RawMessage(tc.body), nil
+				assert.Equal(t, http.StatusUnprocessableEntity, quote(token.Key).Code)
+			})
+		}
+		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
+	})
+	t.Run("plugin-owned Responses model is not priced as a channel request", func(t *testing.T) {
+		registry := pluginruntime.NewRegistry()
+		_, err := registry.Register(`
+			export const meta = {
+				apiVersion: 1, key: "estimate-responses-plugin", name: "Estimate responses plugin",
+				version: "1.0.0", author: {name: "Test"}, models: ["plugin-responses-model"], fetchMode: "per_task",
+				protocols: [{name: "openai_responses", models: ["plugin-responses-model"], supports: ["sync"]}]
+			};
+			export const protocols = {openai_responses: {
+				decodeRequest(request) { return {model: request.body.model, input: request.body.input}; },
+				renderFinal() { return {}; }
+			}};
+			export function buildSubmitRequest() { return {}; }
+			export function parseSubmitResponse() { return {taskId: "task-1"}; }
+			export function parseTaskResult() { return {status: "processing"}; }
+			export function buildQueryRequest() { return {}; }
+		`, pluginruntime.Options{Key: "estimate-responses-plugin", Version: "1.0.0"})
+		require.NoError(t, err)
+		previous := pluginruntime.DefaultRegistry
+		pluginruntime.DefaultRegistry = registry
+		t.Cleanup(func() { pluginruntime.DefaultRegistry = previous })
+		envelope["method"], envelope["path"] = http.MethodPost, "/v1/responses"
+		envelope["body"], envelope["headers"] = common.RawMessage(`{"model":"plugin-responses-model","input":"hello"}`), nil
+		assert.Equal(t, http.StatusUnprocessableEntity, quote(token.Key).Code)
+		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
 	})
 	t.Run("nominal prices ignore funding optimizations", func(t *testing.T) {
 		operation_setting.GetQuotaSetting().PreConsumeMultiplier = 3

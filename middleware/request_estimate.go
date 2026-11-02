@@ -14,13 +14,15 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/net/http/httpguts"
 )
 
 // EstimateTarget restores a target request after the outer credential has been checked.
-// targetPath comes from the same declaration that registers the real relay route.
-func EstimateTarget(targetPath string) gin.HandlerFunc {
+// resolveTarget matches against the real relay route registrations.
+func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFormat, bool)) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		var envelope struct {
@@ -49,7 +51,12 @@ func EstimateTarget(targetPath string) gin.HandlerFunc {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
 			return
 		}
-		if envelope.Method != http.MethodPost || target.Path != targetPath || len(envelope.MediaInfo) > 0 {
+		if envelope.Method != http.MethodPost || len(envelope.MediaInfo) > 0 {
+			abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
+			return
+		}
+		relayFormat, supported := resolveTarget(envelope.Method, target.Path)
+		if !supported {
 			abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
 			return
 		}
@@ -116,7 +123,17 @@ func EstimateTarget(targetPath string) gin.HandlerFunc {
 		inner.ContentLength = int64(len(body))
 		common.CleanupBodyStorage(c)
 		c.Request = inner
+		c.Set("estimate_relay_format", relayFormat)
 		defer func() { common.CleanupBodyStorage(c); c.Request = outer }()
+		if relayFormat == types.RelayFormatOpenAIResponses {
+			generation := pluginruntime.DefaultRegistry.Generation()
+			if modelRequest, modelErr := getModelFromRequest(c); modelErr == nil && generation != nil {
+				if _, pluginOwned := lookupTaskPluginEndpoint(generation, envelope.Method, target.Path, modelRequest.Model); pluginOwned {
+					abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
+					return
+				}
+			}
+		}
 		c.Next()
 	}
 }
