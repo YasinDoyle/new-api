@@ -96,6 +96,18 @@ func requestEstimateTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": "estimate_pricing_failed"}})
 		return
 	}
+	if action := c.GetString("task_action"); action != "" {
+		info.Action = action
+	}
+	info.InitChannelMeta(c)
+	if taskErr := relay.ResolveOriginTask(c, info); taskErr != nil {
+		c.JSON(taskErr.StatusCode, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": taskErr.Code}})
+		return
+	}
+	if taskErr := relay.ApplyChannelPin(c, info); taskErr != nil {
+		c.JSON(taskErr.StatusCode, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": taskErr.Code}})
+		return
+	}
 	prepared, taskErr := relay.PrepareTaskBilling(c, info)
 	if taskErr != nil {
 		status := taskErr.StatusCode

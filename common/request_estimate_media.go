@@ -82,6 +82,9 @@ func ParseRequestEstimateMediaInfo(raw json.RawMessage, body []byte) ([]RequestE
 				return nil, fmt.Errorf("image media_info cannot contain duration")
 			}
 		case "audio":
+			if strings.TrimSpace(string(entry["duration_seconds"])) == "null" {
+				return nil, fmt.Errorf("invalid media_info audio duration")
+			}
 			if err := Unmarshal(entry["duration_seconds"], &fact.DurationSecond); err != nil || math.IsNaN(fact.DurationSecond) || math.IsInf(fact.DurationSecond, 0) || fact.DurationSecond < 0 || fact.DurationSecond > 3600 {
 				return nil, fmt.Errorf("invalid media_info audio duration")
 			}

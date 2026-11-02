@@ -7,17 +7,78 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	taskdto "github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
+// prepareRequestEstimateRemix resolves the original channel before distribution
+// so key selection uses the read-only estimate path rather than live rotation.
+func prepareRequestEstimateRemix(c *gin.Context) (string, error) {
+	origin, exists, err := model.GetByTaskId(common.GetContextKeyInt(c, constant.ContextKeyUserId), c.Param("video_id"))
+	if err != nil || !exists || origin == nil {
+		return "", errors.New("origin task not found or not owned by you")
+	}
+	channel, err := model.CacheGetChannel(origin.ChannelId)
+	if err != nil || channel == nil || channel.Status != common.ChannelStatusEnabled {
+		return "", errors.New("origin task channel is disabled")
+	}
+	modelName := origin.Properties.OriginModelName
+	if modelName == "" {
+		modelName = origin.Properties.UpstreamModelName
+	}
+	if modelName == "" {
+		var data map[string]any
+		_ = common.Unmarshal(origin.Data, &data)
+		modelName, _ = data["model"].(string)
+	}
+	if modelName == "" {
+		return "", errors.New("origin task model is unavailable")
+	}
+	generation := pluginruntime.DefaultRegistry.Generation()
+	plugin, ok := generation.Get(string(origin.Platform))
+	if !ok {
+		for _, candidate := range generation.Plugins() {
+			if slices.Contains(taskPluginLegacyPlatforms(candidate.Meta), origin.Platform) {
+				plugin, ok = candidate, true
+				break
+			}
+		}
+	}
+	if !ok {
+		return "", errors.New("origin task plugin is unavailable")
+	}
+	c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: generation, Plugin: plugin})
+	c.Set("expected_task_plugin_key", plugin.Meta.Key)
+	c.Set("task_plugin_key", plugin.Meta.Key)
+	c.Set("platform", plugin.Meta.Key)
+	service.GetChannelConstraints(c).AddPin(taskdto.ChannelPin{
+		ChannelId: channel.Id, Source: taskdto.PinSourceOriginTask,
+		Rank: taskdto.PinRankOriginTask, RetryMode: taskdto.PinRetrySameChannel,
+	})
+	c.Set("task_action", constant.TaskActionRemix)
+	return modelName, nil
+}
+
 // PrepareRequestEstimateNativeRoute decodes a dynamically matched native
 // submit route using the same plugin hook and intent checks as live routing.
 func PrepareRequestEstimateNativeRoute() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if c.Param("video_id") != "" && strings.HasSuffix(c.Request.URL.Path, "/remix") {
+			modelName, err := prepareRequestEstimateRemix(c)
+			if err != nil {
+				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
+				return
+			}
+			c.Set("resolved_task_model", modelName)
+		}
 		value, exists := c.Get(pluginruntime.ContextKeyPinnedRoute)
 		if !exists {
 			c.Next()

@@ -44,12 +44,13 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			return
 		}
 		target, err := url.ParseRequestURI(envelope.Path)
-		cleanPath := ""
-		if err == nil {
-			cleanPath = path.Clean(target.Path)
+		if err != nil {
+			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
+			return
 		}
+		cleanPath := path.Clean(target.Path)
 		nonCanonicalPath := cleanPath != target.Path && cleanPath+"/" != target.Path
-		if err != nil || target.IsAbs() || target.Host != "" || strings.HasPrefix(envelope.Path, "//") || strings.Contains(envelope.Path, "#") || nonCanonicalPath || strings.ContainsAny(target.Path, "\\\x00") {
+		if target.IsAbs() || target.Host != "" || strings.HasPrefix(envelope.Path, "//") || strings.Contains(envelope.Path, "#") || nonCanonicalPath || strings.ContainsAny(target.Path, "\\\x00") {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
 			return
 		}
@@ -73,6 +74,8 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			parts := strings.Split(strings.Trim(target.Path, "/"), "/")
 			if len(parts) == 3 && parts[0] == "v1" && parts[1] == "tasks" && strings.TrimSpace(parts[2]) != "" {
 				taskPluginKey = parts[2]
+			} else if len(parts) == 4 && parts[0] == "v1" && parts[1] == "videos" && parts[3] == "remix" {
+				c.Params = append(c.Params, gin.Param{Key: "video_id", Value: parts[2]})
 			} else {
 				generation := pluginruntime.DefaultRegistry.Generation()
 				route, params, nativeRoute := generation.LookupDeclaredRequestRouteParams(envelope.Method, target.Path)
@@ -146,6 +149,7 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			abortWithOpenAiMessage(c, http.StatusRequestEntityTooLarge, i18n.T(c, i18n.MsgEstimateInvalidRequest))
 			return
 		}
+		var multipartForm *multipart.Form
 		if mediaType == "multipart/form-data" {
 			_, params, _ := mime.ParseMediaType(headers.Get("Content-Type"))
 			boundary := params["boundary"]
@@ -162,6 +166,7 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest), types.ErrorCodeInvalidRequest)
 				return
 			}
+			multipartForm = form
 			tooLarge := false
 			for _, files := range form.File {
 				for _, file := range files {
@@ -186,6 +191,12 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 		if mediaErr != nil {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, mediaErr.Error(), types.ErrorCodeInvalidRequest)
 			return
+		}
+		for _, fact := range mediaInfo {
+			if fact.Field != "" && (multipartForm == nil || fact.Index >= len(multipartForm.File[fact.Field])) {
+				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest), types.ErrorCodeInvalidRequest)
+				return
+			}
 		}
 		query.Del("key")
 		// Keep the original query bytes unless an identity parameter must be removed.

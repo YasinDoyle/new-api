@@ -3,17 +3,23 @@ package router
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -39,6 +45,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type requestEstimateTransport func(*http.Request) (*http.Response, error)
+
+func (transport requestEstimateTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
 
 // This is the public acceptance seam shared by the estimate tickets. The
 // optional DSN points only at a disposable integration-test database.
@@ -80,6 +92,19 @@ func setupRequestEstimateDB(t *testing.T) {
 	t.Logf("estimate database: %s %s", common.MainDatabaseType(), version)
 }
 
+func requestEstimateBusinessSnapshot(t *testing.T) map[string]string {
+	t.Helper()
+	state := map[string]string{}
+	for _, table := range []string{"users", "tokens", "channels", "abilities", "logs", "tasks", "user_subscriptions", "subscription_pre_consume_records"} {
+		var rows []map[string]any
+		require.NoError(t, model.DB.Table(table).Find(&rows).Error)
+		data, err := common.Marshal(rows)
+		require.NoError(t, err)
+		state[table] = string(data)
+	}
+	return state
+}
+
 func TestRequestEstimateContract(t *testing.T) {
 	setupRequestEstimateDB(t)
 	savedConfig := map[string]string{}
@@ -115,15 +140,7 @@ func TestRequestEstimateContract(t *testing.T) {
 	envelope := map[string]any{"method": "POST", "path": "/v1/chat/completions", "body": common.RawMessage(body)}
 	// Snapshot all persisted business state, including empty accounting tables.
 	snapshot := func() map[string]string {
-		state := map[string]string{}
-		for _, table := range []string{"users", "tokens", "channels", "abilities", "logs", "tasks", "user_subscriptions", "subscription_pre_consume_records"} {
-			var rows []map[string]any
-			require.NoError(t, model.DB.Table(table).Find(&rows).Error)
-			data, err := common.Marshal(rows)
-			require.NoError(t, err)
-			state[table] = string(data)
-		}
-		return state
+		return requestEstimateBusinessSnapshot(t)
 	}
 	quoteWithContext := func(auth string, ctx context.Context) *httptest.ResponseRecorder {
 		data, err := common.Marshal(envelope)
@@ -192,6 +209,7 @@ func TestRequestEstimateContract(t *testing.T) {
 			{"encoded traversal", "/v1/%2e%2e/v1/chat/completions", 400},
 			{"fragment", "/v1/chat/completions#fragment", 400},
 			{"bad query", "/v1/chat/completions?x=%GG", 400},
+			{"malformed path", "/v1/%GG", 400},
 			{"recursive", "/v1/requests/estimate", 422},
 			{"realtime", "/v1/realtime", 422},
 			{"unimplemented Gemini countTokens", "/v1beta/models/estimate-chat:countTokens", 422},
@@ -950,11 +968,13 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 		  if (ctx.upstreamModel !== "mapped-task-estimate-model") throw new Error("model was not mapped before validation");
 		  if (ctx.apiKey !== "channel-secret-b") throw new Error("wrong estimated key");
 		  if (ctx.originTasks !== undefined) throw new Error("unresolved origin tasks were exposed");
+		  if (ctx.mediaInfo !== undefined) throw new Error("estimate media facts leaked into submit preparation");
 		  return {url: ctx.baseUrl + "/submit", method: "POST", body: {model: ctx.model}};
 		}
 		export function extractUsage(ctx) {
 		  if (ctx.mediaInfo) {
 		    if (ctx.requestBody.media_reference !== "opaque-audio-reference") throw new Error("media facts changed the request body");
+		    if (typeof ctx.mediaInfo[0].durationSeconds !== "number") throw new Error("audio duration was lost");
 		    return {seconds: ctx.mediaInfo[0].durationSeconds};
 		  }
 		  return {seconds: 2};
@@ -1005,15 +1025,7 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 	}
 
 	snapshot := func() map[string]string {
-		state := map[string]string{}
-		for _, table := range []string{"users", "tokens", "channels", "abilities", "logs", "tasks", "user_subscriptions", "subscription_pre_consume_records"} {
-			var rows []map[string]any
-			require.NoError(t, model.DB.Table(table).Find(&rows).Error)
-			data, marshalErr := common.Marshal(rows)
-			require.NoError(t, marshalErr)
-			state[table] = string(data)
-		}
-		return state
+		return requestEstimateBusinessSnapshot(t)
 	}
 	before := snapshot()
 	quote := request("/v1/tasks/"+plugin.Meta.Key, `{"model":"task-estimate-model","metadata":{"originTaskIds":["forged-task"]}}`)
@@ -1026,23 +1038,61 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 	assert.Zero(t, providerCalls.Load(), "a task estimate must never send the submit descriptor")
 	assert.Equal(t, before, snapshot(), "estimate must not persist business state or advance key polling")
 
-	mediaPayload, err := common.Marshal(map[string]any{
-		"method": http.MethodPost, "path": "/v1/tasks/" + plugin.Meta.Key,
-		"body":       common.RawMessage(`{"model":"task-estimate-model","media_reference":"opaque-audio-reference"}`),
-		"media_info": common.RawMessage(`[{"pointer":"/media_reference","type":"audio","duration_seconds":4}]`),
-	})
-	require.NoError(t, err)
-	mediaRequest := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(mediaPayload))
-	mediaRequest.Header.Set("Authorization", "Bearer "+token.Key)
-	mediaRequest.Header.Set("Content-Type", "application/json")
-	mediaQuote := httptest.NewRecorder()
-	engine.ServeHTTP(mediaQuote, mediaRequest)
-	require.Equal(t, http.StatusOK, mediaQuote.Code, mediaQuote.Body.String())
-	var mediaResult map[string]any
-	require.NoError(t, common.Unmarshal(mediaQuote.Body.Bytes(), &mediaResult))
-	assert.Equal(t, float64(400000), mediaResult["quota"])
-	assert.Equal(t, "0.8", mediaResult["amount"], "request media facts must affect task pre-consume pricing")
-	assert.Equal(t, before, snapshot(), "request media facts are estimate-local")
+	for _, valid := range []struct {
+		duration int
+		quota    int
+		amount   string
+	}{{4, 400000, "0.8"}, {0, 0, "0"}} {
+		mediaPayload, err := common.Marshal(map[string]any{
+			"method": http.MethodPost, "path": "/v1/tasks/" + plugin.Meta.Key,
+			"body":       common.RawMessage(`{"model":"task-estimate-model","media_reference":"opaque-audio-reference"}`),
+			"media_info": []map[string]any{{"pointer": "/media_reference", "type": "audio", "duration_seconds": valid.duration}},
+		})
+		require.NoError(t, err)
+		mediaRequest := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(mediaPayload))
+		mediaRequest.Header.Set("Authorization", "Bearer "+token.Key)
+		mediaRequest.Header.Set("Content-Type", "application/json")
+		mediaQuote := httptest.NewRecorder()
+		engine.ServeHTTP(mediaQuote, mediaRequest)
+		require.Equal(t, http.StatusOK, mediaQuote.Code, mediaQuote.Body.String())
+		var mediaResult map[string]any
+		require.NoError(t, common.Unmarshal(mediaQuote.Body.Bytes(), &mediaResult))
+		assert.EqualValues(t, valid.quota, mediaResult["quota"])
+		assert.Equal(t, valid.amount, mediaResult["amount"], "request media facts must affect task pre-consume pricing")
+		assert.Equal(t, before, snapshot(), "request media facts are estimate-local")
+	}
+	for _, tc := range []struct{ name, facts string }{
+		{"multipart target on JSON", `[{"field":"nonexistent","index":999,"type":"audio","duration_seconds":4}]`},
+		{"null duration", `[{"pointer":"/media_reference","type":"audio","duration_seconds":null}]`},
+		{"missing target", `[{"pointer":"/missing","type":"audio","duration_seconds":4}]`},
+		{"nonstring target", `[{"pointer":"/quantity","type":"audio","duration_seconds":4}]`},
+		{"duplicate target", `[{"pointer":"/media_reference","type":"audio","duration_seconds":4},{"pointer":"/media_reference","type":"audio","duration_seconds":5}]`},
+		{"oversized duration", `[{"pointer":"/media_reference","type":"audio","duration_seconds":3601}]`},
+		{"negative duration", `[{"pointer":"/media_reference","type":"audio","duration_seconds":-1}]`},
+		{"oversized width", `[{"pointer":"/media_reference","type":"image","width":32769,"height":1}]`},
+		{"mixed units", `[{"pointer":"/media_reference","type":"audio","duration_seconds":4,"width":1}]`},
+		{"forged origin context", `[{"pointer":"/media_reference","type":"audio","duration_seconds":4,"originTaskId":"forged-task"}]`},
+		{"too many facts", `[` + strings.Repeat(`{"pointer":"/media_reference","type":"audio","duration_seconds":4},`, 64) + `{"pointer":"/media_reference","type":"audio","duration_seconds":4}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := common.Marshal(map[string]any{
+				"method": http.MethodPost, "path": "/v1/tasks/" + plugin.Meta.Key,
+				"body":       common.RawMessage(`{"model":"task-estimate-model","media_reference":"opaque-audio-reference","quantity":1}`),
+				"media_info": common.RawMessage(tc.facts),
+			})
+			require.NoError(t, err)
+			request := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(payload))
+			request.Header.Set("Authorization", "Bearer "+token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), `"amount"`)
+			assert.NotContains(t, response.Body.String(), "channel-secret")
+			assert.Equal(t, before, snapshot())
+			assert.Zero(t, providerCalls.Load())
+		})
+	}
 
 	legacyPlugin, err := registry.Register(`
 		export const meta = {apiVersion:1,key:"estimate-legacy-task",name:"Estimate legacy task",version:"1.0.0",author:{name:"Test"},models:["legacy-task-model"],fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second"}}};
@@ -1092,7 +1142,8 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 		  usageSchema: {seconds: {type: "number", unit: "second"}}
 		};
 		export function buildSubmitRequest(ctx) {
-		  return utils.fetch("`+fetchTrap.URL+`/inference", {method: "GET"}).then(function() { return {url: ctx.baseUrl + "/submit"}; });
+		  utils.fetch({url:"`+fetchTrap.URL+`/inference", method:"GET"});
+		  return {url:ctx.baseUrl+"/submit"};
 		}
 		export function extractUsage() { return {seconds: 1}; }
 		export function parseSubmitResponse() { return {taskId: "unused"}; }
@@ -1100,7 +1151,7 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 		export function parseTaskResult() { return {status: "SUCCESS"}; }
 	`, pluginruntime.Options{})
 	require.NoError(t, err)
-	fetchChannel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "fetch-secret", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "fetch-model", Group: "default"}
+	fetchChannel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "fetch-secret", BaseURL: &fetchTrap.URL, Status: common.ChannelStatusEnabled, Models: "fetch-model", Group: "default"}
 	fetchChannel.SetSetting(dto.ChannelSettings{TaskPluginKey: fetchPlugin.Meta.Key})
 	require.NoError(t, model.DB.Create(&fetchChannel).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "fetch-model", ChannelId: fetchChannel.Id, Enabled: true}).Error)
@@ -1144,7 +1195,13 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 		export const native = {
 		  decodeNative(ctx) {
 		    if (ctx.path !== "/estimate-native/jobs/task-7" || ctx.params.task_id !== "task-7" || ctx.query.action[0] !== "extend" || !["POST", "PUT"].includes(ctx.method)) throw new Error("native request context was not preserved");
-		    return {kind: "submit", model: ctx.body.value.model, action: ctx.query.action[0], requestBody: {seconds: ctx.body.value.seconds}};
+		    if (ctx.body.kind === "multipart") return {kind:"submit", model:ctx.body.fields.model[0], action:"extend", requestBody:{file:ctx.body.files[1].ref}};
+		    const intent = {kind: "submit", model: ctx.body.value.model, action: ctx.query.action[0], requestBody: {seconds: ctx.body.value.seconds}};
+		    if (ctx.body.value.originTaskIds) {
+		      intent.originTaskIds = ctx.body.value.originTaskIds;
+		      intent.requestBody.requiresOrigin = true;
+		    }
+		    return intent;
 		  },
 		  renderNative(ctx, task) { return task; }
 		};
@@ -1153,8 +1210,18 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 		  openai_video: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: ctx.body.value.seconds}}; }, render(ctx, task) { return task.data; }},
 		  openai_responses: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: ctx.body.value.seconds}}; }, renderEvents() { return {events: [], state: null, done: false}; }, renderFinal(ctx, task) { return task.data; }}
 		};
-		export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/submit", method: "POST", body: ctx.requestBody}; }
-		export function extractUsage(ctx) { return {seconds: ctx.requestBody.seconds}; }
+		export function buildSubmitRequest(ctx) {
+		  if (ctx.mediaInfo !== undefined) throw new Error("media facts leaked to submit preparation");
+		  if (ctx.requestBody.requiresOrigin && (!ctx.originTasks || ctx.originTasks[0].upstreamTaskId !== "private-origin-id")) throw new Error("origin task was not resolved");
+		  return {url: ctx.baseUrl + "/submit", method: "POST", body: ctx.requestBody};
+		}
+		export function extractUsage(ctx) {
+		  if (ctx.requestBody.file) {
+		    if (ctx.requestBody.file !== "request_file:audio#1" || ctx.mediaInfo[0].field !== "audio" || ctx.mediaInfo[0].index !== 1) throw new Error("file binding was lost");
+		    return {seconds: ctx.mediaInfo[0].durationSeconds};
+		  }
+		  return {seconds: ctx.requestBody.seconds};
+		}
 		export function listArtifacts() { return []; }
 		export function buildContentRequest() { return {}; }
 		export function parseSubmitResponse() { return {taskId: "unused"}; }
@@ -1191,6 +1258,7 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 	SetTaskPluginProtocolRouter(engine)
 	require.NoError(t, registry.ReplaceOverrides([]*pluginruntime.LoadedPlugin{plugin}))
 	quoteMethodWithBody := func(method, path, body string) *httptest.ResponseRecorder {
+		before := requestEstimateBusinessSnapshot(t)
 		payload, marshalErr := common.Marshal(map[string]any{"method": method, "path": path, "body": common.RawMessage(body)})
 		require.NoError(t, marshalErr)
 		request := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(payload))
@@ -1198,6 +1266,7 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
 		engine.ServeHTTP(response, request)
+		assert.Equal(t, before, requestEstimateBusinessSnapshot(t))
 		return response
 	}
 	quoteWithBody := func(path, body string) *httptest.ResponseRecorder {
@@ -1228,6 +1297,73 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 	assert.Equal(t, float64(200000), streamingResult["quota"])
 	putQuote := quoteMethodWithBody(http.MethodPut, "/estimate-native/jobs/task-7?action=extend", `{"model":"dynamic-route-model","seconds":2}`)
 	require.Equal(t, http.StatusOK, putQuote.Code, putQuote.Body.String())
+	t.Run("multipart facts bind to the actual repeated file", func(t *testing.T) {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		require.NoError(t, writer.WriteField("model", "dynamic-route-model"))
+		for _, filename := range []string{"first.wav", "second.wav"} {
+			file, err := writer.CreateFormFile("audio", filename)
+			require.NoError(t, err)
+			_, err = file.Write([]byte("opaque-media"))
+			require.NoError(t, err)
+		}
+		require.NoError(t, writer.Close())
+		for _, scenario := range []struct {
+			field  string
+			index  int
+			status int
+		}{{"audio", 1, 200}, {"missing", 1, 400}, {"audio", 2, 400}, {"model", 0, 400}} {
+			before := requestEstimateBusinessSnapshot(t)
+			payload, err := common.Marshal(map[string]any{
+				"method": http.MethodPost, "path": "/estimate-native/jobs/task-7?action=extend",
+				"headers": http.Header{"Content-Type": {writer.FormDataContentType()}}, "body_base64": base64.StdEncoding.EncodeToString(body.Bytes()),
+				"media_info": []map[string]any{{"field": scenario.field, "index": scenario.index, "type": "audio", "duration_seconds": 4}},
+			})
+			require.NoError(t, err)
+			request := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(payload))
+			request.Header.Set("Authorization", "Bearer "+token.Key)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, scenario.status, response.Code, response.Body.String())
+			if scenario.status == 200 {
+				var result map[string]any
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+				assert.Equal(t, "0.8", result["amount"])
+				assert.EqualValues(t, 400000, result["quota"])
+			} else {
+				assert.NotContains(t, response.Body.String(), `"amount"`)
+			}
+			assert.Equal(t, before, requestEstimateBusinessSnapshot(t))
+		}
+	})
+	t.Run("native origin task ownership platform and channel are enforced", func(t *testing.T) {
+		for _, scenario := range []struct {
+			id       string
+			userID   int
+			platform constant.TaskPlatform
+			status   int
+		}{
+			{"owned-origin", user.Id, constant.TaskPlatform(plugin.Meta.Key), 200},
+			{"foreign-origin", user.Id + 1, constant.TaskPlatform(plugin.Meta.Key), 400},
+			{"wrong-platform", user.Id, constant.TaskPlatform("other-plugin"), 400},
+		} {
+			origin := model.Task{TaskID: scenario.id, UserId: scenario.userID, ChannelId: channel.Id, Platform: scenario.platform, PrivateData: model.TaskPrivateData{UpstreamTaskID: "private-origin-id"}}
+			require.NoError(t, model.DB.Create(&origin).Error)
+			response := quoteWithBody("/estimate-native/jobs/task-7?action=extend", fmt.Sprintf(`{"model":"dynamic-route-model","seconds":2,"originTaskIds":[%q]}`, scenario.id))
+			require.Equal(t, scenario.status, response.Code, response.Body.String())
+			assert.NotContains(t, response.Body.String(), "private-origin-id")
+			if scenario.status == 200 {
+				assert.Contains(t, response.Body.String(), `"amount":"0.4"`)
+			}
+		}
+		require.NoError(t, model.DB.Model(&channel).Update("status", common.ChannelStatusManuallyDisabled).Error)
+		model.InitChannelCache()
+		disabled := quoteWithBody("/estimate-native/jobs/task-7?action=extend", `{"model":"dynamic-route-model","seconds":2,"originTaskIds":["owned-origin"]}`)
+		assert.Equal(t, http.StatusBadRequest, disabled.Code, disabled.Body.String())
+		require.NoError(t, model.DB.Model(&channel).Update("status", common.ChannelStatusEnabled).Error)
+		model.InitChannelCache()
+	})
 	replacement, err := registry.Register(`
 		export const meta = {
 		  apiVersion: 1, key: "estimate-dynamic-routes", name: "Estimate dynamic routes", version: "2.0.0",
@@ -1348,15 +1484,18 @@ func TestRequestEstimateBuiltInPluginUsageHooks(t *testing.T) {
 			channel.SetSetting(dto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
 			require.NoError(t, model.DB.Create(&channel).Error)
 			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: tc.model, ChannelId: channel.Id, Enabled: true}).Error)
+			channels := map[string]int{tc.model: channel.Id}
 			if tc.pluginKey == "alibaba" {
 				imageChannel := model.Channel{Type: channelType, Key: channelKey, BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "wan2.7-image", Group: "default"}
 				imageChannel.SetSetting(dto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
 				require.NoError(t, model.DB.Create(&imageChannel).Error)
 				require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "wan2.7-image", ChannelId: imageChannel.Id, Enabled: true}).Error)
+				channels["wan2.7-image"] = imageChannel.Id
 			}
 			model.InitChannelCache()
 
 			quote := func(path, body string) *httptest.ResponseRecorder {
+				before := requestEstimateBusinessSnapshot(t)
 				payload, marshalErr := common.Marshal(map[string]any{"method": http.MethodPost, "path": path, "body": common.RawMessage(body)})
 				require.NoError(t, marshalErr)
 				request := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(payload))
@@ -1364,6 +1503,7 @@ func TestRequestEstimateBuiltInPluginUsageHooks(t *testing.T) {
 				request.Header.Set("Content-Type", "application/json")
 				response := httptest.NewRecorder()
 				engine.ServeHTTP(response, request)
+				assert.Equal(t, before, requestEstimateBusinessSnapshot(t), "built-in estimate preserves business state")
 				return response
 			}
 			response := quote("/v1/responses", tc.body)
@@ -1373,6 +1513,82 @@ func TestRequestEstimateBuiltInPluginUsageHooks(t *testing.T) {
 			assert.Equal(t, tc.amount, result["amount"])
 			assert.Equal(t, plugin.Meta.Key, result["channel"].(map[string]any)["plugin"])
 			assert.Zero(t, providerCalls.Load(), "built-in plugin estimate must not send the submit descriptor")
+			if tc.pluginKey == "vertex-ai" {
+				t.Run("OAuth cold cache failure and gateway bypass", func(t *testing.T) {
+					client, err := service.GetHttpClientWithProxy("")
+					require.NoError(t, err)
+					originalTransport := client.Transport
+					defer func() { client.Transport = originalTransport }()
+					var exchanges, unexpectedRequests int
+					failExchange := false
+					client.Transport = requestEstimateTransport(func(request *http.Request) (*http.Response, error) {
+						if request.URL.String() != "https://www.googleapis.com/oauth2/v4/token" {
+							unexpectedRequests++
+							return nil, fmt.Errorf("unexpected estimate network request")
+						}
+						exchanges++
+						assert.Equal(t, http.MethodPost, request.Method)
+						require.NoError(t, request.ParseForm())
+						assert.Equal(t, "urn:ietf:params:oauth:grant-type:jwt-bearer", request.Form.Get("grant_type"))
+						assert.NotEmpty(t, request.Form.Get("assertion"))
+						body := `{"access_token":"estimate-oauth-token-secret","expires_in":3600}`
+						if failExchange {
+							body = `{"error":"estimate-oauth-error-secret"}`
+						}
+						return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+					})
+					var logs bytes.Buffer
+					common.LogWriterMu.Lock()
+					originalWriter, originalErrorWriter := gin.DefaultWriter, gin.DefaultErrorWriter
+					gin.DefaultWriter, gin.DefaultErrorWriter = &logs, &logs
+					common.LogWriterMu.Unlock()
+					defer func() {
+						common.LogWriterMu.Lock()
+						gin.DefaultWriter, gin.DefaultErrorWriter = originalWriter, originalErrorWriter
+						common.LogWriterMu.Unlock()
+					}()
+					gateway := quote("/v1/responses", tc.body)
+					require.Equal(t, http.StatusOK, gateway.Code, gateway.Body.String())
+					assert.Zero(t, exchanges, "New API gateway credentials need no vendor OAuth")
+					privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+					require.NoError(t, err)
+					der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+					require.NoError(t, err)
+					keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+					credentials := map[string]string{"project_id": "estimate-project", "client_email": "estimate@example.com", "private_key": keyPEM, "private_key_id": "estimate-cold"}
+					for _, failure := range []bool{false, true} {
+						failExchange = failure
+						if failure {
+							credentials["private_key_id"] = "estimate-failure"
+						}
+						encoded, err := common.Marshal(credentials)
+						require.NoError(t, err)
+						require.NoError(t, model.DB.Model(&channel).Updates(map[string]any{"type": constant.ChannelTypeVertexAi, "key": string(encoded)}).Error)
+						model.InitChannelCache()
+						for range 2 {
+							response := quote("/v1/responses", tc.body)
+							if failure {
+								assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+								assert.NotContains(t, response.Body.String(), `"amount"`)
+								break
+							}
+							require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+							var result map[string]any
+							require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+							assert.Equal(t, "0.005", result["amount"])
+							assert.EqualValues(t, 2500, result["quota"])
+							assert.NotContains(t, response.Body.String(), "estimate-oauth-token-secret")
+						}
+						assert.Equal(t, map[bool]int{false: 1, true: 2}[failure], exchanges, "success uses the cached token; failed credentials fail closed")
+					}
+					assert.Zero(t, unexpectedRequests, "only the fixed OAuth exchange endpoint may be contacted")
+					for _, secret := range []string{keyPEM, "estimate-oauth-token-secret", "estimate-oauth-error-secret", "sk-estimate-gateway"} {
+						assert.NotContains(t, logs.String(), secret)
+					}
+					require.NoError(t, model.DB.Model(&channel).Updates(map[string]any{"type": channelType, "key": channelKey}).Error)
+					model.InitChannelCache()
+				})
+			}
 			if tc.pluginKey == "sora" {
 				for _, target := range []struct {
 					path string
@@ -1387,6 +1603,61 @@ func TestRequestEstimateBuiltInPluginUsageHooks(t *testing.T) {
 					require.NoError(t, common.Unmarshal(extra.Body.Bytes(), &extraResult))
 					assert.Equal(t, tc.amount, extraResult["amount"])
 				}
+				t.Run("remix uses owned origin and its channel", func(t *testing.T) {
+					SetVideoRouter(engine)
+					channel.Key = "sora-key-one\nsora-key-two"
+					channel.ChannelInfo = model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling, MultiKeyPollingIndex: 1}
+					require.NoError(t, model.DB.Model(&channel).Updates(map[string]any{"key": channel.Key, "channel_info": channel.ChannelInfo}).Error)
+					competing := model.Channel{Type: channelType, Key: channelKey, BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: tc.model, Group: "default", Priority: new(int64(100))}
+					competing.SetSetting(dto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+					require.NoError(t, model.DB.Create(&competing).Error)
+					require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: tc.model, ChannelId: competing.Id, Enabled: true, Priority: competing.Priority}).Error)
+					model.InitChannelCache()
+					origin := model.Task{TaskID: "estimate-sora-origin", UserId: user.Id, ChannelId: channel.Id, Platform: constant.TaskPlatform("sora"), Status: model.TaskStatusSuccess, Properties: model.Properties{OriginModelName: tc.model}, Data: common.RawMessage(`{"model":"sora-2","seconds":"8","size":"1792x1024"}`)}
+					require.NoError(t, model.DB.Create(&origin).Error)
+					foreign := model.Task{TaskID: "estimate-sora-foreign", UserId: user.Id + 1, ChannelId: channel.Id, Platform: constant.TaskPlatform("sora"), Properties: model.Properties{OriginModelName: tc.model}}
+					require.NoError(t, model.DB.Create(&foreign).Error)
+					// The existing legacy validator replaces the remix action before
+					// usage extraction, so pre-consume uses the four-second default.
+					require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: `{}`}))
+					require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"sora-2":0.001}`))
+					ordinary := quote("/v1/videos", `{"model":"sora-2","prompt":"a cat"}`)
+					require.Equal(t, http.StatusOK, ordinary.Code, ordinary.Body.String())
+					var ordinaryResult map[string]any
+					require.NoError(t, common.Unmarshal(ordinary.Body.Bytes(), &ordinaryResult))
+					assert.EqualValues(t, competing.Id, ordinaryResult["channel"].(map[string]any)["id"])
+					for _, scenario := range []struct {
+						id     string
+						status int
+					}{{origin.TaskID, 200}, {foreign.TaskID, 400}, {"missing-origin", 400}} {
+						response := quote("/v1/videos/"+scenario.id+"/remix", `{"prompt":"a cat","model":"forged-model"}`)
+						require.Equal(t, scenario.status, response.Code, response.Body.String())
+						if scenario.status == 200 {
+							var result map[string]any
+							require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+							assert.Equal(t, "0.004", result["amount"])
+							assert.EqualValues(t, 2000, result["quota"])
+							assert.Equal(t, tc.model, result["model"])
+							assert.EqualValues(t, channel.Id, result["channel"].(map[string]any)["id"])
+						} else {
+							assert.NotContains(t, response.Body.String(), `"amount"`)
+						}
+					}
+					require.NoError(t, model.DB.Model(&origin).Update("platform", constant.TaskPlatform(strconv.Itoa(constant.ChannelTypeOpenAI))).Error)
+					legacy := quote("/v1/videos/"+origin.TaskID+"/remix", `{"prompt":"a cat"}`)
+					require.Equal(t, http.StatusOK, legacy.Code, legacy.Body.String())
+					cached, err := model.CacheGetChannel(channel.Id)
+					require.NoError(t, err)
+					assert.Equal(t, 1, cached.ChannelInfo.MultiKeyPollingIndex, "origin pin must not advance the key cursor")
+					require.NoError(t, model.DB.Model(&channel).Update("status", common.ChannelStatusManuallyDisabled).Error)
+					model.InitChannelCache()
+					disabled := quote("/v1/videos/"+origin.TaskID+"/remix", `{"prompt":"a cat"}`)
+					assert.Equal(t, 400, disabled.Code, disabled.Body.String())
+					require.NoError(t, model.DB.Model(&channel).Update("status", common.ChannelStatusEnabled).Error)
+					require.NoError(t, model.DB.Model(&competing).Update("status", common.ChannelStatusManuallyDisabled).Error)
+					require.NoError(t, model.DB.Model(&model.Ability{}).Where("channel_id = ?", competing.Id).Update("enabled", false).Error)
+					model.InitChannelCache()
+				})
 			}
 			if tc.pluginKey == "jimeng" {
 				native := quote("/jimeng/?Action=CVSync2AsyncSubmitTask&Version=2022-08-31", `{"req_key":"jimeng_vgfm_t2v_l20","prompt":"a cinematic landscape","duration":5}`)
@@ -1404,6 +1675,103 @@ func TestRequestEstimateBuiltInPluginUsageHooks(t *testing.T) {
 				assert.Equal(t, "0.002", imageResult["amount"])
 				assert.EqualValues(t, 1000, imageResult["quota"])
 				assert.Equal(t, plugin.Meta.Key, imageResult["channel"].(map[string]any)["plugin"])
+			}
+
+			// These prices make the request-derived quantities observable at the
+			// public boundary. Expected amounts and quotas are worked examples,
+			// independent of the production usage and quota helpers.
+			specialCases := map[string][]struct {
+				name, model, path, body, expression, amount string
+				quota, status                               int
+			}{
+				"doubao": {
+					{"missing duration reserves twelve seconds", tc.model, "/v1/responses", `{"model":"doubao-seedance-1-0-pro-250528","input":"a cat","resolution":"720p"}`, "", "0.2592", 129600, 200},
+					{"smart duration reserves twelve seconds", tc.model, "/v1/responses", `{"model":"doubao-seedance-1-0-pro-250528","input":"a cat","seconds":-1,"resolution":"720p"}`, "", "0.2592", 129600, 200},
+					{"new profile reserves thirty seconds", "doubao-seedance-2-5-260628", "/v1/responses", `{"model":"doubao-seedance-2-5-260628","input":"a cat","seconds":-1,"resolution":"720p"}`, "", "0.648", 324000, 200},
+					{"endpoint mapping keeps fifteen second profile", "doubao-seedance-2-0-fast-260128", "/v1/responses", `{"model":"doubao-seedance-2-0-fast-260128","input":"a cat","seconds":-1,"resolution":"720p"}`, "", "0.324", 162000, 200},
+					{"endpoint mapping keeps resolution limits", "doubao-seedance-2-0-fast-260128", "/v1/responses", `{"model":"doubao-seedance-2-0-fast-260128","input":"a cat","seconds":5,"resolution":"1080p"}`, "", "", 0, 400},
+				},
+				"alibaba": {
+					{"smart duration reserves thirty seconds", "wan3.0-video", "/v1/videos", `{"model":"wan3.0-video","prompt":"a cat","seconds":-1}`, "", "0.03", 15000, 200},
+					{"passthrough duration overrides smart duration", "wan3.0-video", "/v1/videos", `{"model":"wan3.0-video","prompt":"a cat","seconds":-1,"metadata":{"parameters":{"duration":8}}}`, "", "0.008", 4000, 200},
+					{"passthrough smart duration overrides explicit duration", "wan3.0-video", "/v1/videos", `{"model":"wan3.0-video","prompt":"a cat","seconds":8,"metadata":{"parameters":{"duration":-1}}}`, "", "0.03", 15000, 200},
+					{"passthrough duration cannot bypass limits", "wan3.0-video", "/v1/videos", `{"model":"wan3.0-video","prompt":"a cat","metadata":{"parameters":{"duration":3601}}}`, "", "", 0, 400},
+					{"image profile counts passthrough quantity", "wan2.7-image", "/v1/images/generations", `{"model":"wan2.7-image","prompt":"a cat","n":1,"parameters":{"n":3}}`, `tier("base", u("image_count") * 0.001)`, "0.003", 1500, 200},
+					{"image passthrough quantity cannot bypass limits", "wan2.7-image", "/v1/images/generations", `{"model":"wan2.7-image","prompt":"a cat","parameters":{"n":129}}`, `tier("base", u("image_count") * 0.001)`, "", 0, 400},
+				},
+				"google": {
+					{"missing duration uses eight seconds", tc.model, "/v1/responses", `{"model":"veo-3.0-generate-001","input":"a cat"}`, "", "0.008", 4000, 200},
+					{"native model action path", tc.model, "/google/v1beta/models/veo-3.0-generate-001:predictLongRunning", `{"instances":[{"prompt":"a cat"}],"parameters":{"durationSeconds":6,"resolution":"1080p","generateAudio":false}}`, "", "0.006", 3000, 200},
+				},
+				"vertex-ai": {
+					{"missing duration uses eight seconds without OAuth on gateway", tc.model, "/v1/responses", `{"model":"veo-3.0-generate-001","input":"a cat"}`, "", "0.008", 4000, 200},
+					{"native project location and model action path", tc.model, "/vertex-ai/v1/projects/estimate-project/locations/us-central1/publishers/google/models/veo-3.0-generate-001:predictLongRunning", `{"instances":[{"prompt":"a cat"}],"parameters":{"durationSeconds":6,"resolution":"1080p","generateAudio":false}}`, "", "0.006", 3000, 200},
+					{"query action cannot be estimated as submission", tc.model, "/vertex-ai/v1/projects/estimate-project/locations/us-central1/publishers/google/models/veo-3.0-generate-001:fetchPredictOperation", `{"operationName":"operations/123"}`, "", "", 0, 400},
+				},
+				"hailuo": {
+					{"missing duration uses six seconds", tc.model, "/v1/responses", `{"model":"MiniMax-Hailuo-2.3","input":"a cat"}`, "", "0.006", 3000, 200},
+					{"H3 reserves maximum input video seconds without probing", "MiniMax-H3", "/v1/tasks/hailuo", `{"model":"MiniMax-H3","prompt":"a cat","metadata":{"reference_video":["` + upstream.URL + `/reference.mp4"]}}`, `tier("base", u("seconds") * 0.001 + u("input_video_seconds") * 0.002)`, "0.035", 17500, 200},
+				},
+				"jimeng": {
+					{"query Action cannot be estimated as submission", tc.model, "/jimeng/?Action=CVSync2AsyncGetResult&Version=2022-08-31", `{"req_key":"jimeng_vgfm_t2v_l20","task_id":"123"}`, "", "", 0, 400},
+				},
+				"sora": {
+					{"missing duration uses four seconds", tc.model, "/v1/videos", `{"model":"sora-2","prompt":"a cat"}`, "", "0.004", 2000, 200},
+				},
+				"vidu": {
+					{"q2 missing duration uses five seconds", tc.model, "/v1/responses", `{"model":"viduq2","input":"a cat"}`, "", "0.005", 2500, 200},
+					{"2.0 missing duration uses four seconds", "vidu2.0", "/v1/tasks/vidu", `{"model":"vidu2.0","prompt":"a cat","image":"` + upstream.URL + `/reference.png"}`, "", "0.004", 2000, 200},
+				},
+				"xai": {
+					{"mapping alias retains upstream usage profile", "estimate-video-alias", "/v1/tasks/xai", `{"model":"estimate-video-alias","prompt":"a cat","duration":15,"resolution":"1080p"}`, `u("resolution") == "1080p" ? tier("high", u("seconds") * 0.002) : tier("base", u("seconds") * 0.001)`, "0.03", 15000, 200},
+					{"extension reserves six output and fifteen input seconds", tc.model, "/xai/v1/videos/extensions", `{"model":"grok-imagine-video","prompt":"continue","video":{"url":"` + upstream.URL + `/reference.mp4"}}`, `tier("base", u("seconds") * 0.001 + u("input_video_seconds") * 0.002)`, "0.036", 18000, 200},
+					{"edit reserves nine input and output seconds", tc.model, "/xai/v1/videos/edits", `{"model":"grok-imagine-video","prompt":"edit","video":{"url":"` + upstream.URL + `/reference.mp4"}}`, `tier("base", u("seconds") * 0.001 + u("input_video_seconds") * 0.002)`, "0.027", 13500, 200},
+					{"extension duration cannot bypass limits", tc.model, "/xai/v1/videos/extensions", `{"model":"grok-imagine-video","prompt":"continue","video":{"url":"` + upstream.URL + `/reference.mp4"},"duration":11}`, "", "", 0, 400},
+					{"1.5 profile permits 1080p", "grok-imagine-video-1.5", "/xai/v1/videos/generations", `{"model":"grok-imagine-video-1.5","prompt":"a cat","duration":15,"resolution":"1080p"}`, `u("resolution") == "1080p" ? tier("high", u("seconds") * 0.002) : tier("base", u("seconds") * 0.001)`, "0.03", 15000, 200},
+					{"base profile rejects 1080p", tc.model, "/xai/v1/videos/generations", `{"model":"grok-imagine-video","prompt":"a cat","duration":15,"resolution":"1080p"}`, "", "", 0, 400},
+				},
+			}
+			for _, scenario := range specialCases[tc.pluginKey] {
+				t.Run(scenario.name, func(t *testing.T) {
+					channelID, exists := channels[scenario.model]
+					if !exists {
+						extraChannel := model.Channel{Type: channelType, Key: channelKey, BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: scenario.model, Group: "default"}
+						extraChannel.SetSetting(dto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+						if scenario.model == "doubao-seedance-2-0-fast-260128" {
+							mapping := `{"doubao-seedance-2-0-fast-260128":"ep-estimate-seedance"}`
+							extraChannel.ModelMapping = &mapping
+						}
+						if scenario.model == "estimate-video-alias" {
+							mapping := `{"estimate-video-alias":"grok-imagine-video-1.5"}`
+							extraChannel.ModelMapping = &mapping
+						}
+						require.NoError(t, model.DB.Create(&extraChannel).Error)
+						require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: scenario.model, ChannelId: extraChannel.Id, Enabled: true}).Error)
+						channelID = extraChannel.Id
+						channels[scenario.model] = channelID
+						model.InitChannelCache()
+					}
+					expression := scenario.expression
+					if expression == "" {
+						expression = `tier("base", u("` + tc.usageKey + `") * ` + tc.price + `)`
+					}
+					billingExpressions[billing_setting.PluginBillingExprKey(tc.pluginKey, scenario.model)] = expression
+					variants, err := common.Marshal(billingExpressions)
+					require.NoError(t, err)
+					require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(variants)}))
+					response := quote(scenario.path, scenario.body)
+					require.Equal(t, scenario.status, response.Code, response.Body.String())
+					if scenario.status == http.StatusOK {
+						var result map[string]any
+						require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+						assert.Equal(t, scenario.amount, result["amount"])
+						assert.EqualValues(t, scenario.quota, result["quota"])
+						assert.EqualValues(t, channelID, result["channel"].(map[string]any)["id"])
+						assert.Equal(t, tc.pluginKey, result["channel"].(map[string]any)["plugin"])
+					}
+					assert.Zero(t, providerCalls.Load(), "estimation must preserve reservation defaults without probing unused media or sending descriptors")
+					assert.NotContains(t, response.Body.String(), channelKey)
+				})
 			}
 		})
 	}
