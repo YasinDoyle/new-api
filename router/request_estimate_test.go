@@ -1202,7 +1202,7 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 		    if (typeof ctx.mediaInfo[0].durationSeconds !== "number") throw new Error("audio duration was lost");
 		    return {seconds: ctx.mediaInfo[0].durationSeconds};
 		  }
-		  return {seconds: 2};
+		  return {seconds: ctx.requestBody.seconds === undefined ? 2 : ctx.requestBody.seconds};
 		}
 		export function parseSubmitResponse() { return {taskId: "unused"}; }
 		export function buildQueryRequest() { return {}; }
@@ -1322,7 +1322,7 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 	legacyPlugin, err := registry.Register(`
 		export const meta = {apiVersion:1,key:"estimate-legacy-task",name:"Estimate legacy task",version:"1.0.0",author:{name:"Test"},models:["legacy-task-model"],fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second"}}};
 		export function buildSubmitRequest(ctx) { return {url:ctx.baseUrl+"/submit"}; }
-		export function extractUsage() { return {seconds:2}; }
+		export function extractUsage(ctx) { return {seconds:ctx.requestBody.seconds === undefined ? 2 : ctx.requestBody.seconds}; }
 		export function parseSubmitResponse() { return {taskId:"unused"}; }
 		export function buildQueryRequest() { return {}; }
 		export function parseTaskResult() { return {status:"SUCCESS"}; }
@@ -1340,6 +1340,40 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 	require.NoError(t, common.Unmarshal(legacyQuote.Body.Bytes(), &legacyResult))
 	assert.Equal(t, float64(10000), legacyResult["quota"], "legacy per-call pricing applies validated usage ratios once")
 	assert.Equal(t, "0.02", legacyResult["amount"])
+
+	t.Run("request usage and billing multipliers", func(t *testing.T) {
+		savedGroupRatio := ratio_setting.GroupRatio2JSONString()
+		savedQuota := *operation_setting.GetQuotaSetting()
+		t.Cleanup(func() {
+			require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(savedGroupRatio))
+			*operation_setting.GetQuotaSetting() = savedQuota
+		})
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1.5}`))
+		// This token-only multiplier must not alter task USD expressions or
+		// multiply legacy per-call usage a second time.
+		operation_setting.GetQuotaSetting().PreConsumeMultiplier = 7
+		before := snapshot()
+		for _, tc := range []struct {
+			name, plugin, body, amount string
+			quota                      int
+		}{
+			{"expression nondefault", plugin.Meta.Key, `{"model":"task-estimate-model","seconds":3}`, "0.9", 450000},
+			{"expression upper bound", plugin.Meta.Key, `{"model":"task-estimate-model","seconds":3600}`, "1080", 540000000},
+			{"expression zero", plugin.Meta.Key, `{"model":"task-estimate-model","seconds":0}`, "0", 0},
+			{"legacy nondefault", legacyPlugin.Meta.Key, `{"model":"legacy-task-model","seconds":3}`, "0.045", 22500},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				response := request("/v1/tasks/"+tc.plugin, tc.body)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				var result map[string]any
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+				assert.EqualValues(t, tc.quota, result["quota"], "quote returns final nominal quota, including usage and group ratio once")
+				assert.Equal(t, tc.amount, result["amount"], "task expressions use USD per task, without token normalization")
+				assert.Equal(t, before, snapshot())
+				assert.Zero(t, providerCalls.Load())
+			})
+		}
+	})
 
 	invalidPlugin, err := registry.Register(`
 		export const meta = {apiVersion:1,key:"estimate-invalid-usage",name:"Estimate invalid usage",version:"1.0.0",author:{name:"Test"},models:["invalid-usage-model"],fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second"}}};
@@ -1367,7 +1401,7 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 		  usageSchema: {seconds: {type: "number", unit: "second"}}
 		};
 		export function buildSubmitRequest(ctx) {
-		  utils.fetch({url:"`+fetchTrap.URL+`/inference", method:"GET"});
+		  utils.fetch({url:ctx.baseUrl+ctx.requestBody.target, method:ctx.requestBody.method});
 		  return {url:ctx.baseUrl+"/submit"};
 		}
 		export function extractUsage() { return {seconds: 1}; }
@@ -1385,12 +1419,27 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 	fetchVariants, err := common.Marshal(map[string]string{billing_setting.PluginBillingExprKey(fetchPlugin.Meta.Key, "fetch-model"): `tier("base", u("seconds") * 0.2)`})
 	require.NoError(t, err)
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(fetchVariants)}))
-	fetchQuote := request("/v1/tasks/"+fetchPlugin.Meta.Key, `{"model":"fetch-model"}`)
-	assert.NotEqual(t, http.StatusOK, fetchQuote.Code, fetchQuote.Body.String())
-	assert.Equal(t, beforeFetch, snapshot(), "failed preparation must not persist business state")
-	assert.Zero(t, providerCalls.Load(), "arbitrary plugin fetches, including GET inference, must be rejected before network access")
-	assert.NotContains(t, fetchQuote.Body.String(), "channel-secret")
-	assert.NotContains(t, fetchQuote.Body.String(), "fetch-secret")
+	for _, target := range []struct{ method, path string }{
+		{http.MethodGet, "/inference"},
+		{http.MethodGet, "/metadata"},
+		{http.MethodHead, "/metadata"},
+		{http.MethodPost, "/files/upload"},
+		{http.MethodPost, "/generate"},
+		{http.MethodPost, "/tasks/submit"},
+		{http.MethodPost, "/resources/create"},
+	} {
+		t.Run(target.method+" "+target.path, func(t *testing.T) {
+			body, err := common.Marshal(map[string]string{"model": "fetch-model", "method": target.method, "target": target.path})
+			require.NoError(t, err)
+			fetchQuote := request("/v1/tasks/"+fetchPlugin.Meta.Key, string(body))
+			assert.Equal(t, http.StatusBadRequest, fetchQuote.Code, fetchQuote.Body.String())
+			assert.NotContains(t, fetchQuote.Body.String(), `"amount"`)
+			assert.Equal(t, beforeFetch, snapshot(), "failed preparation must not persist business state")
+			assert.Zero(t, providerCalls.Load(), "HTTP method and matching upstream host do not authorize plugin network access")
+			assert.NotContains(t, fetchQuote.Body.String(), "channel-secret")
+			assert.NotContains(t, fetchQuote.Body.String(), "fetch-secret")
+		})
+	}
 }
 
 func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
@@ -1438,9 +1487,11 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 		export function buildSubmitRequest(ctx) {
 		  if (ctx.mediaInfo !== undefined) throw new Error("media facts leaked to submit preparation");
 		  if (ctx.requestBody.requiresOrigin && (!ctx.originTasks || ctx.originTasks[0].upstreamTaskId !== "private-origin-id")) throw new Error("origin task was not resolved");
+		  if (ctx.requestBody.requiresOrigin && ctx.originTasks[0].status !== "SUCCESS") throw new Error("extend requires a successful origin task");
 		  return {url: ctx.baseUrl + "/submit", method: "POST", body: ctx.requestBody};
 		}
 		export function extractUsage(ctx) {
+		  if (ctx.requestBody.requiresOrigin) return {seconds:ctx.originTasks[0].data.seconds};
 		  if (ctx.requestBody.file) {
 		    if (ctx.requestBody.file !== "request_file:audio#1" || ctx.mediaInfo[0].field !== "audio" || ctx.mediaInfo[0].index !== 1) throw new Error("file binding was lost");
 		    return {seconds: ctx.mediaInfo[0].durationSeconds};
@@ -1564,24 +1615,35 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 	})
 	t.Run("native origin task ownership platform and channel are enforced", func(t *testing.T) {
 		for _, scenario := range []struct {
-			id       string
-			userID   int
-			platform constant.TaskPlatform
-			status   int
+			id           string
+			userID       int
+			platform     constant.TaskPlatform
+			originStatus model.TaskStatus
+			status       int
 		}{
-			{"owned-origin", user.Id, constant.TaskPlatform(plugin.Meta.Key), 200},
-			{"foreign-origin", user.Id + 1, constant.TaskPlatform(plugin.Meta.Key), 400},
-			{"wrong-platform", user.Id, constant.TaskPlatform("other-plugin"), 400},
+			{"owned-origin", user.Id, constant.TaskPlatform(plugin.Meta.Key), model.TaskStatusSuccess, 200},
+			{"foreign-origin", user.Id + 1, constant.TaskPlatform(plugin.Meta.Key), model.TaskStatusSuccess, 400},
+			{"wrong-platform", user.Id, constant.TaskPlatform("other-plugin"), model.TaskStatusSuccess, 400},
+			{"pending-origin", user.Id, constant.TaskPlatform(plugin.Meta.Key), model.TaskStatusInProgress, 400},
 		} {
-			origin := model.Task{TaskID: scenario.id, UserId: scenario.userID, ChannelId: channel.Id, Platform: scenario.platform, PrivateData: model.TaskPrivateData{UpstreamTaskID: "private-origin-id"}}
+			origin := model.Task{TaskID: scenario.id, UserId: scenario.userID, ChannelId: channel.Id, Platform: scenario.platform, Status: scenario.originStatus, Data: common.RawMessage(`{"seconds":4}`), PrivateData: model.TaskPrivateData{UpstreamTaskID: "private-origin-id"}}
 			require.NoError(t, model.DB.Create(&origin).Error)
 			response := quoteWithBody("/estimate-native/jobs/task-7?action=extend", fmt.Sprintf(`{"model":"dynamic-route-model","seconds":2,"originTaskIds":[%q]}`, scenario.id))
 			require.Equal(t, scenario.status, response.Code, response.Body.String())
 			assert.NotContains(t, response.Body.String(), "private-origin-id")
 			if scenario.status == 200 {
-				assert.Contains(t, response.Body.String(), `"amount":"0.4"`)
+				var result map[string]any
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+				assert.Equal(t, "0.8", result["amount"], "the hook receives the resolved origin pricing context instead of the requested two seconds")
+				assert.EqualValues(t, 400000, result["quota"])
+				assert.EqualValues(t, channel.Id, result["channel"].(map[string]any)["id"])
+			} else {
+				assert.NotContains(t, response.Body.String(), `"amount"`)
 			}
 		}
+		missing := quoteWithBody("/estimate-native/jobs/task-7?action=extend", `{"model":"dynamic-route-model","seconds":2,"originTaskIds":["missing-origin"],"metadata":{"originTasks":[{"status":"SUCCESS","data":{"seconds":4}}]}}`)
+		assert.Equal(t, http.StatusBadRequest, missing.Code, missing.Body.String())
+		assert.NotContains(t, missing.Body.String(), `"amount"`)
 		require.NoError(t, model.DB.Model(&channel).Update("status", common.ChannelStatusManuallyDisabled).Error)
 		model.InitChannelCache()
 		disabled := quoteWithBody("/estimate-native/jobs/task-7?action=extend", `{"model":"dynamic-route-model","seconds":2,"originTaskIds":["owned-origin"]}`)
@@ -1744,23 +1806,40 @@ func TestRequestEstimateBuiltInPluginUsageHooks(t *testing.T) {
 					require.NoError(t, err)
 					originalTransport := client.Transport
 					defer func() { client.Transport = originalTransport }()
-					var exchanges, unexpectedRequests int
-					failExchange := false
-					client.Transport = requestEstimateTransport(func(request *http.Request) (*http.Response, error) {
-						if request.URL.String() != "https://www.googleapis.com/oauth2/v4/token" {
-							unexpectedRequests++
-							return nil, fmt.Errorf("unexpected estimate network request")
-						}
-						exchanges++
+					var exchanges, unexpectedRequests atomic.Int32
+					var failExchange atomic.Bool
+					oauth := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+						exchanges.Add(1)
+						assert.Equal(t, "/oauth2/v4/token", request.URL.Path)
 						assert.Equal(t, http.MethodPost, request.Method)
-						require.NoError(t, request.ParseForm())
+						if !assert.NoError(t, request.ParseForm()) {
+							w.WriteHeader(http.StatusBadRequest)
+							return
+						}
 						assert.Equal(t, "urn:ietf:params:oauth:grant-type:jwt-bearer", request.Form.Get("grant_type"))
 						assert.NotEmpty(t, request.Form.Get("assertion"))
-						body := `{"access_token":"estimate-oauth-token-secret","expires_in":3600}`
-						if failExchange {
-							body = `{"error":"estimate-oauth-error-secret"}`
+						w.Header().Set("Content-Type", "application/json")
+						if failExchange.Load() {
+							w.WriteHeader(http.StatusBadRequest)
+							_, _ = io.WriteString(w, `{"error":"estimate-oauth-error-secret"}`)
+							return
 						}
-						return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+						_, _ = io.WriteString(w, `{"access_token":"estimate-oauth-token-secret","expires_in":3600}`)
+					}))
+					t.Cleanup(oauth.Close)
+					oauthURL, err := url.Parse(oauth.URL)
+					require.NoError(t, err)
+					client.Transport = requestEstimateTransport(func(request *http.Request) (*http.Response, error) {
+						if request.URL.String() != "https://www.googleapis.com/oauth2/v4/token" {
+							unexpectedRequests.Add(1)
+							return nil, fmt.Errorf("unexpected estimate network request")
+						}
+						// Keep the real exchange encoding and response parsing; only
+						// route the fixed credential recipient to the local TLS server.
+						local := request.Clone(request.Context())
+						local.URL.Scheme, local.URL.Host = oauthURL.Scheme, oauthURL.Host
+						local.Host = oauthURL.Host
+						return oauth.Client().Transport.RoundTrip(local)
 					})
 					var logs bytes.Buffer
 					common.LogWriterMu.Lock()
@@ -1774,15 +1853,18 @@ func TestRequestEstimateBuiltInPluginUsageHooks(t *testing.T) {
 					}()
 					gateway := quote("/v1/responses", tc.body)
 					require.Equal(t, http.StatusOK, gateway.Code, gateway.Body.String())
-					assert.Zero(t, exchanges, "New API gateway credentials need no vendor OAuth")
+					assert.Zero(t, exchanges.Load(), "New API gateway credentials need no vendor OAuth")
 					privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 					require.NoError(t, err)
 					der, err := x509.MarshalPKCS8PrivateKey(privateKey)
 					require.NoError(t, err)
 					keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+					// A PEM line remains literal even when a leaked key is JSON
+					// escaped, unlike the full key's embedded newlines.
+					secrets := []string{strings.SplitN(keyPEM, "\n", 3)[1], "estimate-oauth-token-secret", "estimate-oauth-error-secret", "sk-estimate-gateway"}
 					credentials := map[string]string{"project_id": "estimate-project", "client_email": "estimate@example.com", "private_key": keyPEM, "private_key_id": "estimate-cold"}
 					for _, failure := range []bool{false, true} {
-						failExchange = failure
+						failExchange.Store(failure)
 						if failure {
 							credentials["private_key_id"] = "estimate-failure"
 						}
@@ -1790,24 +1872,29 @@ func TestRequestEstimateBuiltInPluginUsageHooks(t *testing.T) {
 						require.NoError(t, err)
 						require.NoError(t, model.DB.Model(&channel).Updates(map[string]any{"type": constant.ChannelTypeVertexAi, "key": string(encoded)}).Error)
 						model.InitChannelCache()
-						for range 2 {
-							response := quote("/v1/responses", tc.body)
+						for _, target := range []struct{ path, body string }{
+							{"/v1/tasks/vertex-ai", `{"model":"veo-3.0-generate-001","prompt":"a cinematic landscape","duration":5}`},
+							{"/v1/responses", tc.body},
+						} {
+							response := quote(target.path, target.body)
+							for _, secret := range secrets {
+								assert.NotContains(t, response.Body.String(), secret)
+							}
 							if failure {
 								assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 								assert.NotContains(t, response.Body.String(), `"amount"`)
-								break
+								continue
 							}
 							require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 							var result map[string]any
 							require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
 							assert.Equal(t, "0.005", result["amount"])
 							assert.EqualValues(t, 2500, result["quota"])
-							assert.NotContains(t, response.Body.String(), "estimate-oauth-token-secret")
 						}
-						assert.Equal(t, map[bool]int{false: 1, true: 2}[failure], exchanges, "success uses the cached token; failed credentials fail closed")
+						assert.EqualValues(t, map[bool]int{false: 1, true: 3}[failure], exchanges.Load(), "success uses the cached token; failed credentials fail closed without caching")
 					}
-					assert.Zero(t, unexpectedRequests, "only the fixed OAuth exchange endpoint may be contacted")
-					for _, secret := range []string{keyPEM, "estimate-oauth-token-secret", "estimate-oauth-error-secret", "sk-estimate-gateway"} {
+					assert.Zero(t, unexpectedRequests.Load(), "only the fixed OAuth exchange endpoint may be contacted")
+					for _, secret := range secrets {
 						assert.NotContains(t, logs.String(), secret)
 					}
 					require.NoError(t, model.DB.Model(&channel).Updates(map[string]any{"type": channelType, "key": channelKey}).Error)
