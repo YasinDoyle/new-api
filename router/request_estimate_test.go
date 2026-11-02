@@ -292,6 +292,145 @@ func TestRequestEstimateContract(t *testing.T) {
 		}
 		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
 	})
+	t.Run("image pricing uses effective count without submission", func(t *testing.T) {
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"gpt-4o":0.01}`))
+		envelope["method"], envelope["path"] = http.MethodPost, "/v1/images/generations"
+		envelope["body"], envelope["headers"] = common.RawMessage(`{"model":"gpt-4o","prompt":"a red cube","n":1}`), nil
+		result := quote(token.Key)
+		require.Equal(t, http.StatusOK, result.Code, result.Body.String())
+		assert.Contains(t, result.Body.String(), `"quota":5000`)
+		assert.Contains(t, result.Body.String(), `"amount":"0.01"`)
+
+		previousOverride := channel.ParamOverride
+		t.Cleanup(func() {
+			require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("param_override", previousOverride).Error)
+			model.InitChannelCache()
+		})
+		override := `{"operations":[{"mode":"set","path":"n","value":3}]}`
+		require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("param_override", override).Error)
+		model.InitChannelCache()
+		result = quote(token.Key)
+		require.Equal(t, http.StatusOK, result.Code, result.Body.String())
+		assert.Contains(t, result.Body.String(), `"quota":15000`)
+		assert.Contains(t, result.Body.String(), `"amount":"0.03"`)
+		delete(envelope, "body")
+		envelope["body"] = common.RawMessage(`{"model":"gpt-4o","prompt":"a red cube","n":1,"parameters":{"n":3}}`)
+		result = quote(token.Key)
+		require.Equal(t, http.StatusOK, result.Code, result.Body.String())
+		assert.Contains(t, result.Body.String(), `"quota":15000`)
+		envelope["body"] = common.RawMessage(`{"model":"gpt-4o","prompt":"a red cube","n":1,"parameters":{"n":129}}`)
+		assert.Equal(t, http.StatusBadRequest, quote(token.Key).Code, "passthrough image counts must retain the existing upper bound")
+		require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("param_override", previousOverride).Error)
+		model.InitChannelCache()
+		var form bytes.Buffer
+		writer := multipart.NewWriter(&form)
+		require.NoError(t, writer.WriteField("model", "gpt-4o"))
+		require.NoError(t, writer.WriteField("prompt", "edit this image"))
+		require.NoError(t, writer.WriteField("n", "2"))
+		file, err := writer.CreateFormFile("image", "input.png")
+		require.NoError(t, err)
+		_, err = file.Write([]byte("image bytes"))
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		envelope["path"] = "/v1/images/edits"
+		delete(envelope, "body")
+		envelope["body_base64"] = base64.StdEncoding.EncodeToString(form.Bytes())
+		envelope["headers"] = http.Header{"Content-Type": {writer.FormDataContentType()}}
+		result = quote(token.Key)
+		require.Equal(t, http.StatusOK, result.Code, result.Body.String())
+		assert.Contains(t, result.Body.String(), `"quota":10000`)
+		assert.Contains(t, result.Body.String(), `"amount":"0.02"`)
+		delete(envelope, "body_base64")
+		delete(envelope, "headers")
+
+		imageBillingConfig := map[string]string{}
+		require.NoError(t, config.GlobalConfig.SaveToDB(func(k, v string) error {
+			if k == "billing_setting.billing_mode" || k == "billing_setting.billing_expr" {
+				imageBillingConfig[k] = v
+			}
+			return nil
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, config.GlobalConfig.LoadFromDB(imageBillingConfig))
+		})
+		for _, tc := range []struct {
+			name, expression      string
+			oneQuota, fourQuota   float64
+			oneAmount, fourAmount string
+		}{
+			{"token-only image expression", `tier("input", p * 4)`, 0, 0, "0", "0"},
+			{"per-request image expression", `tier("request", fixed(0.02))`, 10000, 10000, "0.02", "0.02"},
+			{"per-image expression", `tier("image", fixed(0.02)) * image_count`, 10000, 40000, "0.02", "0.08"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				modes, err := common.Marshal(map[string]string{"gpt-4o": "tiered_expr"})
+				require.NoError(t, err)
+				expressions, err := common.Marshal(map[string]string{"gpt-4o": tc.expression})
+				require.NoError(t, err)
+				require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.billing_mode": string(modes), "billing_setting.billing_expr": string(expressions)}))
+				envelope["path"] = "/v1/images/generations"
+				envelope["body"] = common.RawMessage(`{"model":"gpt-4o","prompt":"a red cube","n":1}`)
+				one := quote(token.Key)
+				require.Equal(t, http.StatusOK, one.Code, one.Body.String())
+				envelope["body"] = common.RawMessage(`{"model":"gpt-4o","prompt":"a red cube","n":4}`)
+				four := quote(token.Key)
+				require.Equal(t, http.StatusOK, four.Code, four.Body.String())
+				var oneResult, fourResult map[string]any
+				require.NoError(t, common.Unmarshal(one.Body.Bytes(), &oneResult))
+				require.NoError(t, common.Unmarshal(four.Body.Bytes(), &fourResult))
+				assert.Equal(t, tc.oneQuota, oneResult["quota"])
+				assert.Equal(t, tc.fourQuota, fourResult["quota"])
+				assert.Equal(t, tc.oneAmount, oneResult["amount"])
+				assert.Equal(t, tc.fourAmount, fourResult["amount"])
+			})
+		}
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.billing_mode": `{}`, "billing_setting.billing_expr": `{}`}))
+		envelope["body"] = common.RawMessage(`{"model":"gpt-4o","prompt":"a red cube","n":1}`)
+
+		originalAbility := model.Ability{}
+		require.NoError(t, model.DB.Where("channel_id = ? AND model = ?", channel.Id, "gpt-4o").First(&originalAbility).Error)
+		require.True(t, originalAbility.Enabled, "fixture image ability must start enabled")
+		t.Cleanup(func() {
+			require.NoError(t, model.DB.Model(&model.Ability{}).Where(&model.Ability{ChannelId: channel.Id, Model: "gpt-4o", Group: "default"}).Update("enabled", originalAbility.Enabled).Error)
+			model.InitChannelCache()
+		})
+		require.NoError(t, model.DB.Model(&model.Ability{}).Where(&model.Ability{ChannelId: channel.Id, Model: "gpt-4o", Group: "default"}).Update("enabled", false).Error)
+		replicateChannel := model.Channel{Type: constant.ChannelTypeReplicate, Key: "replicate-test-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "black-forest-labs/flux-1.1-pro", Group: "default"}
+		require.NoError(t, model.DB.Create(&replicateChannel).Error)
+		t.Cleanup(func() {
+			require.NoError(t, model.DB.Where("channel_id = ?", replicateChannel.Id).Delete(&model.Ability{}).Error)
+			require.NoError(t, model.DB.Delete(&replicateChannel).Error)
+			model.InitChannelCache()
+		})
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "black-forest-labs/flux-1.1-pro", ChannelId: replicateChannel.Id, Enabled: true}).Error)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"black-forest-labs/flux-1.1-pro":0.02}`))
+		beforeCalls := calls.Load()
+		envelope["path"] = "/v1/images/edits"
+		form.Reset()
+		writer = multipart.NewWriter(&form)
+		require.NoError(t, writer.WriteField("model", "black-forest-labs/flux-1.1-pro"))
+		require.NoError(t, writer.WriteField("prompt", "edit this image"))
+		require.NoError(t, writer.WriteField("n", "2"))
+		file, err = writer.CreateFormFile("image", "input.png")
+		require.NoError(t, err)
+		_, err = file.Write([]byte("image bytes"))
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		delete(envelope, "body")
+		envelope["body_base64"] = base64.StdEncoding.EncodeToString(form.Bytes())
+		envelope["headers"] = http.Header{"Content-Type": {writer.FormDataContentType()}}
+		result = quote(token.Key)
+		require.Equal(t, http.StatusOK, result.Code, result.Body.String())
+		assert.Contains(t, result.Body.String(), `"quota":20000`)
+		assert.Contains(t, result.Body.String(), `"amount":"0.04"`)
+		assert.Equal(t, beforeCalls, calls.Load(), "Replicate edit estimates must not upload files or submit predictions")
+		require.NoError(t, model.DB.Model(&model.Ability{}).Where(&model.Ability{ChannelId: channel.Id, Model: "gpt-4o", Group: "default"}).Update("enabled", originalAbility.Enabled).Error)
+		model.InitChannelCache()
+		delete(envelope, "body_base64")
+		delete(envelope, "headers")
+		envelope["body"] = common.RawMessage(body)
+		envelope["method"], envelope["path"], envelope["body"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body)
+	})
 	t.Run("plugin-owned Responses model is not priced as a channel request", func(t *testing.T) {
 		registry := pluginruntime.NewRegistry()
 		_, err := registry.Register(`

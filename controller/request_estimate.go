@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -36,6 +37,16 @@ func RequestEstimate(c *gin.Context, relayFormat types.RelayFormat) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": "estimate_pricing_failed"}})
 		return
 	}
+	imageCount := 0
+	if _, isImageRequest := request.(*dto.ImageRequest); isImageRequest {
+		info.InitChannelMeta(c)
+		var imageErr *types.NewAPIError
+		imageCount, imageErr = relay.PrepareImageRequestEstimate(c, info)
+		if imageErr != nil {
+			c.JSON(imageErr.StatusCode, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimateInvalidRequest), "type": "invalid_request_error", "code": "invalid_request"}})
+			return
+		}
+	}
 	if apiErr := relay.PrepareRequestPricing(c, info); apiErr != nil {
 		if apiErr.GetErrorCode() == types.ErrorCodeCountTokenFailed {
 			status := http.StatusBadRequest
@@ -48,6 +59,12 @@ func RequestEstimate(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.JSON(apiErr.StatusCode, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": "estimate_pricing_failed"}})
 		return
+	}
+	if imageCount > 0 {
+		if apiErr := service.CalculateImageBillingForRequest(c, info, imageCount); apiErr != nil {
+			c.JSON(apiErr.StatusCode, gin.H{"error": gin.H{"message": i18n.T(c, i18n.MsgEstimatePricingFailed), "type": "invalid_request_error", "code": "estimate_pricing_failed"}})
+			return
+		}
 	}
 	quota := info.PriceData.QuotaToPreConsume
 	snapshot, refreshErr := service.RefreshTieredBillingGroup(info)

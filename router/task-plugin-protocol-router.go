@@ -17,6 +17,9 @@ func SetTaskPluginProtocolRouter(router *gin.Engine) {
 				if protocol.Name == "openai_responses" && operation.Name == "create" {
 					registerRequestEstimateRoute(method, operation.Path, types.RelayFormatOpenAIResponses)
 				}
+				if protocol.Name == "openai_image" && (operation.Name == "generate" || operation.Name == "edit") {
+					registerRequestEstimateRoute(method, operation.Path, types.RelayFormatOpenAIImage)
+				}
 				handlers, err := taskPluginProtocolHandlers(protocol.Name, operation.Name)
 				if err != nil {
 					panic(err)
