@@ -44,7 +44,12 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			return
 		}
 		target, err := url.ParseRequestURI(envelope.Path)
-		if err != nil || target.IsAbs() || target.Host != "" || strings.HasPrefix(envelope.Path, "//") || strings.Contains(envelope.Path, "#") || path.Clean(target.Path) != target.Path || strings.ContainsAny(target.Path, "\\\x00") {
+		cleanPath := ""
+		if err == nil {
+			cleanPath = path.Clean(target.Path)
+		}
+		nonCanonicalPath := cleanPath != target.Path && cleanPath+"/" != target.Path
+		if err != nil || target.IsAbs() || target.Host != "" || strings.HasPrefix(envelope.Path, "//") || strings.Contains(envelope.Path, "#") || nonCanonicalPath || strings.ContainsAny(target.Path, "\\\x00") {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
 			return
 		}

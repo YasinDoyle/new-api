@@ -25,6 +25,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
@@ -1263,4 +1264,147 @@ func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
 	removed := quote("/estimate-native/jobs/task-7?action=extend")
 	assert.Equal(t, http.StatusUnprocessableEntity, removed.Code, removed.Body.String())
 	assert.Zero(t, providerCalls.Load(), "estimate must not submit to the provider")
+}
+
+func TestRequestEstimateBuiltInPluginUsageHooks(t *testing.T) {
+	setupRequestEstimateDB(t)
+	savedConfig := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(k, v string) error { savedConfig[k] = v; return nil }))
+	savedPrices := ratio_setting.ModelPrice2JSONString()
+	savedRatios := ratio_setting.ModelRatio2JSONString()
+	savedRegistry := pluginruntime.DefaultRegistry
+	t.Cleanup(func() {
+		pluginruntime.DefaultRegistry = savedRegistry
+		require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices))
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatios))
+	})
+
+	cases := []struct {
+		pluginKey string
+		model     string
+		body      string
+		usageKey  string
+		price     string
+		amount    string
+	}{
+		{"alibaba", "wan2.7-t2v", `{"model":"wan2.7-t2v","input":"a cinematic landscape","seconds":5,"resolution":"720P"}`, "seconds", "0.001", "0.005"},
+		{"doubao", "doubao-seedance-1-0-pro-250528", `{"model":"doubao-seedance-1-0-pro-250528","input":"a cinematic landscape","seconds":5,"resolution":"720p"}`, "tokens", "0.000001", "0.108"},
+		{"google", "veo-3.0-generate-001", `{"model":"veo-3.0-generate-001","input":"a cinematic landscape","seconds":5}`, "seconds", "0.001", "0.005"},
+		{"vertex-ai", "veo-3.0-generate-001", `{"model":"veo-3.0-generate-001","input":"a cinematic landscape","seconds":5}`, "seconds", "0.001", "0.005"},
+		{"hailuo", "MiniMax-Hailuo-2.3", `{"model":"MiniMax-Hailuo-2.3","input":"a cinematic landscape","seconds":6}`, "seconds", "0.001", "0.006"},
+		{"jimeng", "jimeng_vgfm_t2v_l20", `{"model":"jimeng_vgfm_t2v_l20","input":"a cinematic landscape","seconds":5}`, "seconds", "0.001", "0.005"},
+		{"kling", "kling-v1", `{"model":"kling-v1","input":"a cinematic landscape","seconds":5}`, "units", "0.001", "0.001"},
+		{"sora", "sora-2", `{"model":"sora-2","input":"a cinematic landscape","seconds":4,"size":"720x1280"}`, "seconds", "0.001", "0.004"},
+		{"sunoapi", "suno_music", `{"model":"suno_music","input":"a cinematic soundtrack"}`, "clips", "0.001", "0.002"},
+		{"vidu", "viduq2", `{"model":"viduq2","input":"a cinematic landscape","seconds":5,"size":"720p"}`, "duration", "0.001", "0.005"},
+		{"xai", "grok-imagine-video", `{"model":"grok-imagine-video","input":"a cinematic landscape","seconds":8,"resolution":"480p"}`, "seconds", "0.001", "0.008"},
+	}
+
+	var providerCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerCalls.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(upstream.Close)
+	user := model.User{Username: "estimate-builtin-user", Status: common.UserStatusEnabled, Group: "default", Quota: 0}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "estimatebuiltintoken", Status: common.TokenStatusExhausted, ExpiredTime: -1}
+	require.NoError(t, model.DB.Create(&token).Error)
+	engine := gin.New()
+	require.NoError(t, engine.SetTrustedProxies(nil))
+	SetRelayRouter(engine)
+	SetTaskRouter(engine)
+	SetTaskPluginProtocolRouter(engine)
+
+	for _, tc := range cases {
+		t.Run(tc.pluginKey, func(t *testing.T) {
+			source, err := builtinplugins.Source(tc.pluginKey)
+			require.NoError(t, err)
+			registry := pluginruntime.NewRegistry()
+			plugin, err := registry.RegisterFactory(source, pluginruntime.Options{Key: tc.pluginKey})
+			require.NoError(t, err)
+			require.NoError(t, registry.ReplaceOverrides(nil))
+			pluginruntime.DefaultRegistry = registry
+
+			billingExpressions := map[string]string{
+				billing_setting.PluginBillingExprKey(tc.pluginKey, tc.model): `tier("base", u("` + tc.usageKey + `") * ` + tc.price + `)`,
+			}
+			if tc.pluginKey == "alibaba" {
+				billingExpressions[billing_setting.PluginBillingExprKey(tc.pluginKey, "wan2.7-image")] = `tier("base", u("image_count") * 0.001)`
+			}
+			variants, err := common.Marshal(billingExpressions)
+			require.NoError(t, err)
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(variants)}))
+
+			channelType, channelKey := constant.ChannelTypeTaskPlugin, "builtin-estimate-secret"
+			if tc.pluginKey == "vertex-ai" {
+				channelType, channelKey = constant.ChannelTypeNewAPI, "sk-estimate-gateway"
+			}
+			if tc.pluginKey == "jimeng" {
+				channelKey = "jimeng-ak|jimeng-sk"
+			}
+			channel := model.Channel{Type: channelType, Key: channelKey, BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: tc.model, Group: "default"}
+			channel.SetSetting(dto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+			require.NoError(t, model.DB.Create(&channel).Error)
+			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: tc.model, ChannelId: channel.Id, Enabled: true}).Error)
+			if tc.pluginKey == "alibaba" {
+				imageChannel := model.Channel{Type: channelType, Key: channelKey, BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "wan2.7-image", Group: "default"}
+				imageChannel.SetSetting(dto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+				require.NoError(t, model.DB.Create(&imageChannel).Error)
+				require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "wan2.7-image", ChannelId: imageChannel.Id, Enabled: true}).Error)
+			}
+			model.InitChannelCache()
+
+			quote := func(path, body string) *httptest.ResponseRecorder {
+				payload, marshalErr := common.Marshal(map[string]any{"method": http.MethodPost, "path": path, "body": common.RawMessage(body)})
+				require.NoError(t, marshalErr)
+				request := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(payload))
+				request.Header.Set("Authorization", "Bearer "+token.Key)
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, request)
+				return response
+			}
+			response := quote("/v1/responses", tc.body)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var result map[string]any
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.Equal(t, tc.amount, result["amount"])
+			assert.Equal(t, plugin.Meta.Key, result["channel"].(map[string]any)["plugin"])
+			assert.Zero(t, providerCalls.Load(), "built-in plugin estimate must not send the submit descriptor")
+			if tc.pluginKey == "sora" {
+				for _, target := range []struct {
+					path string
+					body string
+				}{
+					{"/v1/tasks/sora", `{"model":"sora-2","prompt":"a cinematic landscape","seconds":4,"size":"720x1280"}`},
+					{"/v1/videos", `{"model":"sora-2","prompt":"a cinematic landscape","seconds":4,"size":"720x1280"}`},
+				} {
+					extra := quote(target.path, target.body)
+					require.Equal(t, http.StatusOK, extra.Code, target.path+": "+extra.Body.String())
+					var extraResult map[string]any
+					require.NoError(t, common.Unmarshal(extra.Body.Bytes(), &extraResult))
+					assert.Equal(t, tc.amount, extraResult["amount"])
+				}
+			}
+			if tc.pluginKey == "jimeng" {
+				native := quote("/jimeng/?Action=CVSync2AsyncSubmitTask&Version=2022-08-31", `{"req_key":"jimeng_vgfm_t2v_l20","prompt":"a cinematic landscape","duration":5}`)
+				require.Equal(t, http.StatusOK, native.Code, native.Body.String())
+				var nativeResult map[string]any
+				require.NoError(t, common.Unmarshal(native.Body.Bytes(), &nativeResult))
+				assert.Equal(t, tc.amount, nativeResult["amount"])
+			}
+			assert.Zero(t, providerCalls.Load(), "native, generic, and host protocol estimates must not submit descriptors")
+			if tc.pluginKey == "alibaba" {
+				image := quote("/v1/images/generations", `{"model":"wan2.7-image","prompt":"a red kite","n":2}`)
+				require.Equal(t, http.StatusOK, image.Code, image.Body.String())
+				var imageResult map[string]any
+				require.NoError(t, common.Unmarshal(image.Body.Bytes(), &imageResult))
+				assert.Equal(t, "0.002", imageResult["amount"])
+				assert.EqualValues(t, 1000, imageResult["quota"])
+				assert.Equal(t, plugin.Meta.Key, imageResult["channel"].(map[string]any)["plugin"])
+			}
+		})
+	}
 }
