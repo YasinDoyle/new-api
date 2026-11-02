@@ -953,7 +953,7 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 		}
 		export function extractUsage(ctx) {
 		  if (ctx.mediaInfo) {
-		    if (ctx.requestBody.media_url !== "https://media.invalid/audio.wav") throw new Error("media facts changed the request body");
+		    if (ctx.requestBody.media_reference !== "opaque-audio-reference") throw new Error("media facts changed the request body");
 		    return {seconds: ctx.mediaInfo[0].durationSeconds};
 		  }
 		  return {seconds: 2};
@@ -1027,8 +1027,8 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 
 	mediaPayload, err := common.Marshal(map[string]any{
 		"method": http.MethodPost, "path": "/v1/tasks/" + plugin.Meta.Key,
-		"body":       common.RawMessage(`{"model":"task-estimate-model","media_url":"https://media.invalid/audio.wav"}`),
-		"media_info": common.RawMessage(`[{"pointer":"/media_url","type":"audio","duration_seconds":4}]`),
+		"body":       common.RawMessage(`{"model":"task-estimate-model","media_reference":"opaque-audio-reference"}`),
+		"media_info": common.RawMessage(`[{"pointer":"/media_reference","type":"audio","duration_seconds":4}]`),
 	})
 	require.NoError(t, err)
 	mediaRequest := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(mediaPayload))
