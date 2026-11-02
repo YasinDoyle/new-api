@@ -951,7 +951,13 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 		  if (ctx.originTasks !== undefined) throw new Error("unresolved origin tasks were exposed");
 		  return {url: ctx.baseUrl + "/submit", method: "POST", body: {model: ctx.model}};
 		}
-		export function extractUsage() { return {seconds: 2}; }
+		export function extractUsage(ctx) {
+		  if (ctx.mediaInfo) {
+		    if (ctx.requestBody.media_url !== "https://media.invalid/audio.wav") throw new Error("media facts changed the request body");
+		    return {seconds: ctx.mediaInfo[0].durationSeconds};
+		  }
+		  return {seconds: 2};
+		}
 		export function parseSubmitResponse() { return {taskId: "unused"}; }
 		export function buildQueryRequest() { return {}; }
 		export function parseTaskResult() { return {status: "SUCCESS"}; }
@@ -1018,6 +1024,24 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 	assert.Equal(t, plugin.Meta.Key, result["channel"].(map[string]any)["plugin"])
 	assert.Zero(t, providerCalls.Load(), "a task estimate must never send the submit descriptor")
 	assert.Equal(t, before, snapshot(), "estimate must not persist business state or advance key polling")
+
+	mediaPayload, err := common.Marshal(map[string]any{
+		"method": http.MethodPost, "path": "/v1/tasks/" + plugin.Meta.Key,
+		"body":       common.RawMessage(`{"model":"task-estimate-model","media_url":"https://media.invalid/audio.wav"}`),
+		"media_info": common.RawMessage(`[{"pointer":"/media_url","type":"audio","duration_seconds":4}]`),
+	})
+	require.NoError(t, err)
+	mediaRequest := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(mediaPayload))
+	mediaRequest.Header.Set("Authorization", "Bearer "+token.Key)
+	mediaRequest.Header.Set("Content-Type", "application/json")
+	mediaQuote := httptest.NewRecorder()
+	engine.ServeHTTP(mediaQuote, mediaRequest)
+	require.Equal(t, http.StatusOK, mediaQuote.Code, mediaQuote.Body.String())
+	var mediaResult map[string]any
+	require.NoError(t, common.Unmarshal(mediaQuote.Body.Bytes(), &mediaResult))
+	assert.Equal(t, float64(400000), mediaResult["quota"])
+	assert.Equal(t, "0.8", mediaResult["amount"], "request media facts must affect task pre-consume pricing")
+	assert.Equal(t, before, snapshot(), "request media facts are estimate-local")
 
 	legacyPlugin, err := registry.Register(`
 		export const meta = {apiVersion:1,key:"estimate-legacy-task",name:"Estimate legacy task",version:"1.0.0",author:{name:"Test"},models:["legacy-task-model"],fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second"}}};

@@ -1610,6 +1610,33 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 	ctx["requestBody"] = requestBody
 	ctx["requestHeaders"] = requestHeaders
 	ctx["files"] = files
+	if c != nil && c.GetBool("request_estimate") {
+		if value, exists := c.Get(common.RequestEstimateMediaInfoContextKey); exists {
+			if facts, ok := value.([]common.RequestEstimateMediaInfo); ok && len(facts) > 0 {
+				mediaInfo := make([]map[string]any, 0, len(facts))
+				for _, fact := range facts {
+					item := map[string]any{"type": fact.Type}
+					if fact.Pointer != "" {
+						item["pointer"] = fact.Pointer
+					} else {
+						item["field"] = fact.Field
+						item["index"] = fact.Index
+					}
+					if fact.Width > 0 {
+						item["width"] = fact.Width
+					}
+					if fact.Height > 0 {
+						item["height"] = fact.Height
+					}
+					if fact.DurationSecond > 0 {
+						item["durationSeconds"] = fact.DurationSecond
+					}
+					mediaInfo = append(mediaInfo, item)
+				}
+				ctx["mediaInfo"] = mediaInfo
+			}
+		}
+	}
 	ctx["action"] = info.Action
 	ctx["originTaskId"] = info.OriginTaskID
 	if info.TaskRelayInfo != nil && len(info.OriginTasks) > 0 {
