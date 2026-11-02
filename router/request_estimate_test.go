@@ -1,9 +1,14 @@
 package router
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -23,6 +28,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
@@ -91,9 +97,9 @@ func TestRequestEstimateContract(t *testing.T) {
 	require.NoError(t, model.DB.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "contractkey", Status: common.TokenStatusExhausted, ExpiredTime: -1}
 	require.NoError(t, model.DB.Create(&token).Error)
-	channel := model.Channel{Type: constant.ChannelTypeOpenAI, Key: "secret-one\nsecret-two", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "estimate-chat,deepseek-search,deepseek-fetch", Group: "default", ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}
+	channel := model.Channel{Type: constant.ChannelTypeOpenAI, Key: "secret-one\nsecret-two", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "estimate-chat,estimate-audio,gpt-4o,deepseek-search,deepseek-fetch", Group: "default", ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling}}
 	require.NoError(t, model.DB.Create(&channel).Error)
-	for _, modelName := range []string{"estimate-chat", "deepseek-search", "deepseek-fetch"} {
+	for _, modelName := range []string{"estimate-chat", "estimate-audio", "gpt-4o", "deepseek-search", "deepseek-fetch"} {
 		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: modelName, ChannelId: channel.Id, Enabled: true}).Error)
 	}
 	engine := gin.New()
@@ -207,7 +213,7 @@ func TestRequestEstimateContract(t *testing.T) {
 		assert.Equal(t, 422, quote(token.Key).Code, "invalid media type must not be accepted as JSON")
 		delete(envelope, "headers")
 		envelope["body"] = common.RawMessage(`{"model":"estimate-chat","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"` + upstream.URL + `/image"}}]}]}`)
-		assert.Equal(t, 422, quote(token.Key).Code, "multimodal is deferred, including media downloads")
+		assert.Equal(t, 200, quote(token.Key).Code, "multimodal inputs are accepted without fetching while measurement is disabled")
 		envelope["body"] = common.RawMessage(body)
 		savedMaxBody := constant.MaxRequestBodyMB
 		constant.MaxRequestBodyMB = 1
@@ -276,7 +282,7 @@ func TestRequestEstimateContract(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				envelope["method"], envelope["path"] = http.MethodPost, tc.path
 				envelope["body"], envelope["headers"] = common.RawMessage(tc.body), nil
-				assert.Equal(t, http.StatusUnprocessableEntity, quote(token.Key).Code)
+				assert.Equal(t, http.StatusOK, quote(token.Key).Code)
 			})
 		}
 		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
@@ -305,6 +311,188 @@ func TestRequestEstimateContract(t *testing.T) {
 		envelope["method"], envelope["path"] = http.MethodPost, "/v1/responses"
 		envelope["body"], envelope["headers"] = common.RawMessage(`{"model":"plugin-responses-model","input":"hello"}`), nil
 		assert.Equal(t, http.StatusUnprocessableEntity, quote(token.Key).Code)
+		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
+	})
+	t.Run("audio multipart accepts request-scoped duration facts", func(t *testing.T) {
+		savedCount, savedRatio := constant.CountToken, ratio_setting.ModelRatio2JSONString()
+		constant.CountToken = true
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"estimate-audio":0.01}`))
+		t.Cleanup(func() {
+			constant.CountToken = savedCount
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatio))
+		})
+		var multipartBody bytes.Buffer
+		writer := multipart.NewWriter(&multipartBody)
+		require.NoError(t, writer.WriteField("model", "estimate-audio"))
+		file, err := writer.CreateFormFile("file", "audio.wav")
+		require.NoError(t, err)
+		_, err = file.Write([]byte("audio bytes are not parsed when duration is supplied"))
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		contentType := writer.FormDataContentType()
+		envelope["method"], envelope["path"] = http.MethodPost, "/v1/audio/transcriptions"
+		envelope["headers"] = http.Header{"Content-Type": {contentType}}
+		delete(envelope, "body")
+		envelope["body_base64"] = base64.StdEncoding.EncodeToString(multipartBody.Bytes())
+		envelope["media_info"] = []map[string]any{{"field": "file", "index": 0, "type": "audio", "duration_seconds": 60}}
+		w := quote(token.Key)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var result map[string]any
+		require.NoError(t, common.Unmarshal(w.Body.Bytes(), &result))
+		assert.Equal(t, "estimate-audio", result["model"])
+		assert.Equal(t, float64(10), result["quota"])
+		assert.Equal(t, "0.00002", result["amount"])
+		delete(envelope, "body_base64")
+		delete(envelope, "media_info")
+		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
+	})
+	t.Run("multimodal image dimensions bind to the original JSON pointer", func(t *testing.T) {
+		savedCount, savedRatio := constant.CountToken, ratio_setting.ModelRatio2JSONString()
+		savedMediaToken, savedMediaTokenNotStream := constant.GetMediaToken, constant.GetMediaTokenNotStream
+		constant.CountToken = true
+		constant.GetMediaToken, constant.GetMediaTokenNotStream = true, true
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":0.01}`))
+		t.Cleanup(func() {
+			constant.CountToken = savedCount
+			constant.GetMediaToken, constant.GetMediaTokenNotStream = savedMediaToken, savedMediaTokenNotStream
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatio))
+		})
+		imageBody := `{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,not-decoded","detail":"high"}}]}]}`
+		quoteImage := func(width, height int) int {
+			envelope["method"], envelope["path"], envelope["body"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(imageBody)
+			envelope["headers"] = http.Header{"Content-Type": {"application/json"}}
+			envelope["media_info"] = []map[string]any{{"pointer": "/messages/0/content/0/image_url/url", "type": "image", "width": width, "height": height}}
+			w := quote(token.Key)
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var result map[string]any
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &result))
+			return int(result["quota"].(float64))
+		}
+		low := quoteImage(512, 512)
+		high := quoteImage(2048, 2048)
+		assert.Equal(t, 2, low)
+		assert.Equal(t, 7, high)
+		assert.Greater(t, high, low, "the bound image dimensions must affect existing image token estimation")
+		delete(envelope, "media_info")
+		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
+	})
+	t.Run("image URL measurements take precedence and remain SSRF protected", func(t *testing.T) {
+		savedCount, savedRatio := constant.CountToken, ratio_setting.ModelRatio2JSONString()
+		savedMediaToken, savedMediaTokenNotStream := constant.GetMediaToken, constant.GetMediaTokenNotStream
+		fetchSetting := system_setting.GetFetchSetting()
+		savedFetch := *fetchSetting
+		constant.CountToken = true
+		constant.GetMediaToken, constant.GetMediaTokenNotStream = true, true
+		fetchSetting.EnableSSRFProtection = true
+		fetchSetting.AllowPrivateIp = true
+		fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode = false, false
+		fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts = nil, nil, nil
+		fetchSetting.ApplyIPFilterForDomain = true
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":0.01}`))
+		t.Cleanup(func() {
+			constant.CountToken = savedCount
+			constant.GetMediaToken, constant.GetMediaTokenNotStream = savedMediaToken, savedMediaTokenNotStream
+			*fetchSetting = savedFetch
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatio))
+		})
+		pngBytes := func() []byte {
+			var data bytes.Buffer
+			img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+			img.Set(0, 0, color.White)
+			require.NoError(t, png.Encode(&data, img))
+			return data.Bytes()
+		}()
+		var calls atomic.Int32
+		mediaServerFails := false
+		mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			if mediaServerFails {
+				http.Error(w, "media unavailable", http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(pngBytes)
+		}))
+		t.Cleanup(mediaServer.Close)
+		imageBody := fmt.Sprintf(`{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":%q,"detail":"high"}}]}]}`, mediaServer.URL+"/image.png")
+		quoteImage := func(withFacts bool) int {
+			envelope["method"], envelope["path"], envelope["body"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(imageBody)
+			envelope["headers"] = http.Header{"Content-Type": {"application/json"}}
+			if withFacts {
+				envelope["media_info"] = []map[string]any{{"pointer": "/messages/0/content/0/image_url/url", "type": "image", "width": 4096, "height": 4096}}
+			} else {
+				delete(envelope, "media_info")
+			}
+			w := quote(token.Key)
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var result map[string]any
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &result))
+			return int(result["quota"].(float64))
+		}
+		withFacts := quoteImage(true)
+		withoutFacts := quoteImage(false)
+		assert.Equal(t, 2, withFacts)
+		assert.Equal(t, 2, withoutFacts)
+		assert.Equal(t, withoutFacts, withFacts, "URL dimensions, not conflicting supplements, determine the measured quote")
+		assert.EqualValues(t, 2, calls.Load())
+		mediaServerFails = true
+		envelope["method"], envelope["path"], envelope["body"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(imageBody)
+		envelope["headers"] = http.Header{"Content-Type": {"application/json"}}
+		envelope["media_info"] = []map[string]any{{"pointer": "/messages/0/content/0/image_url/url", "type": "image", "width": 1, "height": 1}}
+		failedQuote := quote(token.Key)
+		assert.Equal(t, http.StatusBadRequest, failedQuote.Code, failedQuote.Body.String())
+		assert.Contains(t, failedQuote.Body.String(), "media_read_failed")
+		assert.EqualValues(t, 3, calls.Load(), "a failed URL read must not fall back to the supplied dimensions")
+
+		fetchSetting.EnableSSRFProtection = false
+		privateURL := fmt.Sprintf("http://127.0.0.1:%s/image.png", strings.Split(mediaServer.Listener.Addr().String(), ":")[1])
+		imageBody = fmt.Sprintf(`{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":%q,"detail":"high"}}]}]}`, privateURL)
+		before := calls.Load()
+		envelope["media_info"] = []map[string]any{{"pointer": "/messages/0/content/0/image_url/url", "type": "image", "width": 1, "height": 1}}
+		w := quote(token.Key)
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Equal(t, before, calls.Load(), "private URLs must be rejected before a network request")
+		delete(envelope, "media_info")
+		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
+	})
+	t.Run("audio speech and translation routes are estimable", func(t *testing.T) {
+		savedRatio := ratio_setting.ModelRatio2JSONString()
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"estimate-audio":0.01}`))
+		t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatio)) })
+		envelope["method"], envelope["path"] = http.MethodPost, "/v1/audio/speech"
+		envelope["headers"], envelope["body"] = http.Header{"Content-Type": {"application/json"}}, common.RawMessage(`{"model":"estimate-audio","input":"hello","voice":"alloy"}`)
+		assert.Equal(t, http.StatusOK, quote(token.Key).Code)
+
+		var multipartBody bytes.Buffer
+		writer := multipart.NewWriter(&multipartBody)
+		require.NoError(t, writer.WriteField("model", "estimate-audio"))
+		file, err := writer.CreateFormFile("file", "audio.wav")
+		require.NoError(t, err)
+		_, err = file.Write([]byte("audio bytes"))
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		envelope["path"], envelope["headers"] = "/v1/audio/translations", http.Header{"Content-Type": {writer.FormDataContentType()}}
+		envelope["body_base64"] = base64.StdEncoding.EncodeToString(multipartBody.Bytes())
+		delete(envelope, "body")
+		assert.Equal(t, http.StatusOK, quote(token.Key).Code)
+		delete(envelope, "body_base64")
+		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
+	})
+	t.Run("malformed or unbound media facts are rejected", func(t *testing.T) {
+		envelope["method"], envelope["path"], envelope["body"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body)
+		for _, facts := range [][]map[string]any{
+			{{"pointer": "/messages/0/content/0/text", "type": "image", "width": 128, "height": 128, "quota": 1}},
+			{{"pointer": "/messages/0/content/0/text", "type": "audio", "duration_seconds": -1}},
+			{{"pointer": "/messages/0/content/0/text", "type": "image", "width": 32768, "height": 32768}},
+			{{"pointer": "/messages/0/content/99/text", "type": "image", "width": 128, "height": 128}},
+			{{"pointer": "/messages/0/content/0/text", "field": "file", "index": 0, "type": "image", "width": 128, "height": 128}},
+			{{"pointer": "/messages/0/content/0/text", "type": "image", "width": 128, "height": 128}, {"pointer": "/messages/0/content/0/text", "type": "image", "width": 256, "height": 256}},
+		} {
+			envelope["media_info"] = facts
+			assert.Equal(t, http.StatusBadRequest, quote(token.Key).Code)
+		}
+		delete(envelope, "media_info")
+		delete(envelope, "body_base64")
 		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
 	})
 	t.Run("nominal prices ignore funding optimizations", func(t *testing.T) {

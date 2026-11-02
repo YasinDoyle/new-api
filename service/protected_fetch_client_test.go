@@ -1,16 +1,21 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
 
@@ -192,6 +197,59 @@ func TestProtectedFetchDialerSkipsResolvedIPCheckWhenDisabled(t *testing.T) {
 	require.NotNil(t, conn)
 
 	require.Equal(t, []string{"safe.example:80"}, dialed)
+}
+
+func TestRequestEstimateImageConfigUsesProtectedWorker(t *testing.T) {
+	previousClient := httpClient
+	previousWorkerURL, previousWorkerKey := system_setting.WorkerUrl, system_setting.WorkerValidKey
+	previousAllowHTTP := system_setting.WorkerAllowHttpImageRequestEnabled
+	fetchSetting := system_setting.GetFetchSetting()
+	previousFetchSetting := *fetchSetting
+	t.Cleanup(func() {
+		httpClient = previousClient
+		system_setting.WorkerUrl, system_setting.WorkerValidKey = previousWorkerURL, previousWorkerKey
+		system_setting.WorkerAllowHttpImageRequestEnabled = previousAllowHTTP
+		*fetchSetting = previousFetchSetting
+	})
+
+	var imageBytes bytes.Buffer
+	require.NoError(t, png.Encode(&imageBytes, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	var workerRequest WorkerRequest
+	workerCalls := 0
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		workerCalls++
+		if r.Method != http.MethodPost || common.DecodeJson(r.Body, &workerRequest) != nil {
+			http.Error(w, "invalid worker request", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write(imageBytes.Bytes())
+	}))
+	t.Cleanup(worker.Close)
+	httpClient = worker.Client()
+	system_setting.WorkerUrl = worker.URL + "/"
+	system_setting.WorkerValidKey = "worker-test-key"
+	system_setting.WorkerAllowHttpImageRequestEnabled = true
+	fetchSetting.EnableSSRFProtection = true
+	fetchSetting.AllowPrivateIp = true
+	fetchSetting.DomainFilterMode, fetchSetting.IpFilterMode = false, false
+	fetchSetting.DomainList, fetchSetting.IpList, fetchSetting.AllowedPorts = nil, nil, nil
+	fetchSetting.ApplyIPFilterForDomain = true
+
+	context, _ := gin.CreateTestContext(httptest.NewRecorder())
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", nil)
+	config, format, err := requestEstimateImageConfig(context, "http://127.0.0.1:8123/image.png")
+	require.NoError(t, err)
+	require.Equal(t, 1, config.Width)
+	require.Equal(t, 1, config.Height)
+	require.Equal(t, "png", format)
+	require.Equal(t, "http://127.0.0.1:8123/image.png", workerRequest.URL)
+	require.Equal(t, "worker-test-key", workerRequest.Key)
+	require.Equal(t, 1, workerCalls)
+
+	fetchSetting.AllowPrivateIp = false
+	_, _, err = requestEstimateImageConfig(context, "http://127.0.0.1:8123/image.png")
+	require.Error(t, err)
+	require.Equal(t, 1, workerCalls, "private destinations must be rejected before the worker request")
 }
 
 func TestGetSSRFProtectedHTTPClientFallsBackToDefaultClientWhenProtectionDisabled(t *testing.T) {

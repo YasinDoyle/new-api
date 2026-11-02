@@ -184,15 +184,9 @@ func SetRelayRouter(router *gin.Engine) {
 		registerRelayEndpoint(httpRouter, http.MethodPost, "/embeddings", types.RelayFormatEmbedding)
 
 		// audio related routes
-		httpRouter.POST("/audio/transcriptions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
-		})
-		httpRouter.POST("/audio/translations", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
-		})
-		httpRouter.POST("/audio/speech", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
-		})
+		registerRelayEndpoint(httpRouter, http.MethodPost, "/audio/transcriptions", types.RelayFormatOpenAIAudio)
+		registerRelayEndpoint(httpRouter, http.MethodPost, "/audio/translations", types.RelayFormatOpenAIAudio)
+		registerRelayEndpoint(httpRouter, http.MethodPost, "/audio/speech", types.RelayFormatOpenAIAudio)
 
 		// rerank related routes
 		registerRelayEndpoint(httpRouter, http.MethodPost, "/rerank", types.RelayFormatRerank)

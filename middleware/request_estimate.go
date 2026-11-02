@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -51,7 +53,7 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
 			return
 		}
-		if envelope.Method != http.MethodPost || len(envelope.MediaInfo) > 0 {
+		if envelope.Method != http.MethodPost {
 			abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
 			return
 		}
@@ -64,7 +66,7 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 		if envelope.BodyBase64 != nil {
 			body, err = base64.StdEncoding.Strict().DecodeString(*envelope.BodyBase64)
 			if err != nil {
-				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
+				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest), types.ErrorCodeInvalidRequest)
 				return
 			}
 		}
@@ -103,8 +105,57 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
 			return
 		}
-		if mediaType != "application/json" {
+		if mediaType != "application/json" && mediaType != "multipart/form-data" {
 			abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
+			return
+		}
+		maxBodyMB := constant.MaxRequestBodyMB
+		if maxBodyMB <= 0 {
+			maxBodyMB = 128
+		}
+		if int64(len(body)) > int64(maxBodyMB)<<20 {
+			abortWithOpenAiMessage(c, http.StatusRequestEntityTooLarge, i18n.T(c, i18n.MsgEstimateInvalidRequest))
+			return
+		}
+		if mediaType == "multipart/form-data" {
+			_, params, _ := mime.ParseMediaType(headers.Get("Content-Type"))
+			boundary := params["boundary"]
+			if boundary == "" {
+				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
+				return
+			}
+			maxFileMB := constant.MaxFileDownloadMB
+			if maxFileMB <= 0 {
+				maxFileMB = 64
+			}
+			form, formErr := multipart.NewReader(bytes.NewReader(body), boundary).ReadForm(32 << 20)
+			if formErr != nil {
+				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest), types.ErrorCodeInvalidRequest)
+				return
+			}
+			tooLarge := false
+			for _, files := range form.File {
+				for _, file := range files {
+					if file.Size > int64(maxFileMB)<<20 {
+						tooLarge = true
+					}
+				}
+			}
+			_ = form.RemoveAll()
+			if tooLarge {
+				abortWithOpenAiMessage(c, http.StatusRequestEntityTooLarge, i18n.T(c, i18n.MsgEstimateInvalidRequest))
+				return
+			}
+		} else if envelope.BodyBase64 != nil || (len(envelope.MediaInfo) > 0 && string(envelope.MediaInfo) != "null") {
+			var jsonBody any
+			if common.Unmarshal(body, &jsonBody) != nil {
+				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
+				return
+			}
+		}
+		mediaInfo, mediaErr := common.ParseRequestEstimateMediaInfo(envelope.MediaInfo, body)
+		if mediaErr != nil {
+			abortWithOpenAiMessage(c, http.StatusBadRequest, mediaErr.Error(), types.ErrorCodeInvalidRequest)
 			return
 		}
 		query.Del("key")
@@ -124,6 +175,10 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 		common.CleanupBodyStorage(c)
 		c.Request = inner
 		c.Set("estimate_relay_format", relayFormat)
+		c.Set("request_estimate", true)
+		if len(mediaInfo) > 0 {
+			c.Set(common.RequestEstimateMediaInfoContextKey, mediaInfo)
+		}
 		defer func() { common.CleanupBodyStorage(c); c.Request = outer }()
 		if relayFormat == types.RelayFormatOpenAIResponses {
 			generation := pluginruntime.DefaultRegistry.Generation()
