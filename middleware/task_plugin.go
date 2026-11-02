@@ -35,6 +35,12 @@ const contextKeyTaskPluginEndpointModel = "task_plugin_endpoint_model_request"
 
 const contextKeyTaskPluginEndpointSelection = "task_plugin_endpoint_channel_selection"
 
+const requestEstimatePluginTargetKey = "request_estimate_plugin_target"
+
+const requestEstimateGenerationKey = "request_estimate_plugin_generation"
+
+const requestEstimateNativeParamsKey = "request_estimate_native_params"
+
 type taskPluginEndpointSelection struct {
 	Generation *pluginruntime.RoutingGeneration
 	Channel    *model.Channel
@@ -344,7 +350,16 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 func RouteTaskPluginEndpoint() gin.HandlerFunc {
 	pinEndpoint := PinTaskPluginEndpoint()
 	return func(c *gin.Context) {
+		if c.GetBool("request_estimate") && !c.GetBool(requestEstimatePluginTargetKey) {
+			c.Next()
+			return
+		}
 		generation := pluginruntime.DefaultRegistry.Generation()
+		if value, exists := c.Get(requestEstimateGenerationKey); exists {
+			if pinned, ok := value.(*pluginruntime.RoutingGeneration); ok {
+				generation = pinned
+			}
+		}
 		request, err := getModelFromRequest(c)
 		if err != nil || generation == nil {
 			pinEndpoint(c)
@@ -367,7 +382,11 @@ func RouteTaskPluginEndpoint() gin.HandlerFunc {
 		constraints.AddFilter(filter)
 		constraints.AddFilter(dto.ChannelFilter{Kind: dto.FilterRequestPath, RequestPath: c.Request.URL.Path})
 		group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-		channel, _, selectErr := service.SelectChannelForRequest(c, request.Model, &service.RetryParam{
+		selectChannel := service.SelectChannelForRequest
+		if c.GetBool("request_estimate") {
+			selectChannel = service.SelectChannelForEstimate
+		}
+		channel, _, selectErr := selectChannel(c, request.Model, &service.RetryParam{
 			Ctx: c, ModelName: request.Model, TokenGroup: group,
 			RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
 		})

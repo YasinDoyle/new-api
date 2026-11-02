@@ -53,7 +53,8 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgEstimateInvalidRequest))
 			return
 		}
-		if envelope.Method != http.MethodPost {
+		envelope.Method = strings.ToUpper(strings.TrimSpace(envelope.Method))
+		if !httpguts.ValidHeaderFieldName(envelope.Method) {
 			abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
 			return
 		}
@@ -65,11 +66,25 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 		taskPluginKey := ""
 		if relayFormat == types.RelayFormatTask {
 			parts := strings.Split(strings.Trim(target.Path, "/"), "/")
-			if len(parts) != 3 || parts[0] != "v1" || parts[1] != "tasks" || strings.TrimSpace(parts[2]) == "" {
-				abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
-				return
+			if len(parts) == 3 && parts[0] == "v1" && parts[1] == "tasks" && strings.TrimSpace(parts[2]) != "" {
+				taskPluginKey = parts[2]
+			} else {
+				generation := pluginruntime.DefaultRegistry.Generation()
+				route, params, nativeRoute := generation.LookupDeclaredRequestRouteParams(envelope.Method, target.Path)
+				_, _, protocolOperation := pluginruntime.LookupHostProtocolOperation(envelope.Method, target.Path)
+				if nativeRoute {
+					c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Generation: generation, Plugin: route.Plugin, Route: route.Route})
+					c.Set(requestEstimateNativeParamsKey, params)
+					c.Set(requestEstimatePluginTargetKey, true)
+					c.Set(requestEstimateGenerationKey, generation)
+				} else if protocolOperation {
+					c.Set(requestEstimatePluginTargetKey, true)
+					c.Set(requestEstimateGenerationKey, generation)
+				} else {
+					abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
+					return
+				}
 			}
-			taskPluginKey = parts[2]
 		}
 		body := []byte(envelope.Body)
 		if envelope.BodyBase64 != nil {
@@ -200,17 +215,15 @@ func EstimateTarget(resolveTarget func(method, targetPath string) (types.RelayFo
 			c.Set("task_plugin_key", taskPluginKey)
 			c.Set("platform", taskPluginKey)
 		}
+		if relayFormat != types.RelayFormatTask {
+			generation := pluginruntime.DefaultRegistry.Generation()
+			if _, _, protocolOperation := pluginruntime.LookupHostProtocolOperation(envelope.Method, target.Path); protocolOperation {
+				c.Set(requestEstimatePluginTargetKey, true)
+				c.Set(requestEstimateGenerationKey, generation)
+			}
+		}
 		if len(mediaInfo) > 0 {
 			c.Set(common.RequestEstimateMediaInfoContextKey, mediaInfo)
-		}
-		if relayFormat == types.RelayFormatOpenAIResponses {
-			generation := pluginruntime.DefaultRegistry.Generation()
-			if modelRequest, modelErr := getModelFromRequest(c); modelErr == nil && generation != nil {
-				if _, pluginOwned := lookupTaskPluginEndpoint(generation, envelope.Method, target.Path, modelRequest.Model); pluginOwned {
-					abortWithOpenAiMessage(c, http.StatusUnprocessableEntity, i18n.T(c, i18n.MsgEstimateUnsupported))
-					return
-				}
-			}
 		}
 		c.Next()
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relaykit/types"
 
@@ -69,15 +70,23 @@ func registerRequestEstimateTaskRoute(method, path string) {
 
 func resolveRequestEstimateRoute(method, path string) (types.RelayFormat, bool) {
 	requestEstimateRouteMu.RLock()
-	defer requestEstimateRouteMu.RUnlock()
 	if requestEstimateRouter == nil || isGeminiCountTokensPath(path) {
+		requestEstimateRouteMu.RUnlock()
 		return "", false
 	}
 	request := httptest.NewRequest(method, path, nil)
 	response := httptest.NewRecorder()
 	requestEstimateRouter.ServeHTTP(response, request)
 	relayFormat := types.RelayFormat(response.Header().Get("X-Request-Estimate-Relay-Format"))
-	return relayFormat, relayFormat != ""
+	requestEstimateRouteMu.RUnlock()
+	if relayFormat != "" {
+		return relayFormat, true
+	}
+	generation := pluginruntime.DefaultRegistry.Generation()
+	if _, found := generation.LookupDeclaredRequestRoute(method, path); found {
+		return types.RelayFormatTask, true
+	}
+	return "", false
 }
 
 func isGeminiCountTokensPath(path string) bool {
@@ -96,7 +105,7 @@ func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	router.Use(middleware.StatsMiddleware())
 	const chatPath = "/chat/completions"
-	router.POST("/v1/requests/estimate", middleware.EstimateRateLimit(), middleware.EstimateTokenAuth(), middleware.EstimateTarget(resolveRequestEstimateRoute), middleware.DistributeForEstimate(), func(c *gin.Context) {
+	router.POST("/v1/requests/estimate", middleware.EstimateRateLimit(), middleware.EstimateTokenAuth(), middleware.EstimateTarget(resolveRequestEstimateRoute), middleware.RouteTaskPluginEndpoint(), middleware.PrepareTaskPluginEndpoint(), middleware.PrepareRequestEstimateNativeRoute(), middleware.DistributeForEstimate(), func(c *gin.Context) {
 		relayFormat, _ := c.Get("estimate_relay_format")
 		controller.RequestEstimate(c, relayFormat.(types.RelayFormat))
 	})

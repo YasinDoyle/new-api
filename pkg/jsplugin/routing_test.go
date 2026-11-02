@@ -55,6 +55,17 @@ func TestRegistryIndexesNativeRoutesAndProtocolsInOneGeneration(t *testing.T) {
 	assert.Equal(t, "routing-alpha", route.Plugin.Meta.Key)
 	assert.Equal(t, "task_id", route.Route.TaskIDParam)
 
+	matchedRoute, ok := generation.LookupDeclaredRequestRoute("POST", "/vendor/videos")
+	require.True(t, ok)
+	assert.Equal(t, plugin.Meta.Key, matchedRoute.Plugin.Meta.Key)
+	assert.Equal(t, RouteTypeSubmit, matchedRoute.Route.Type)
+	_, ok = generation.LookupDeclaredRequestRoute("GET", "/vendor/videos/task-123?verbose=1")
+	assert.False(t, ok, "request targets exclude query from route matching and query routes are not submissions")
+	_, ok = generation.LookupDeclaredRequestRoute("POST", "/vendor/videos?verbose=1")
+	assert.False(t, ok, "callers pass the parsed path separately from its query")
+	_, ok = generation.LookupDeclaredRequestRoute("POST", "/vendor/videos/task-123")
+	assert.False(t, ok)
+
 	endpoint, ok := generation.LookupEndpoint("POST", "/v1/responses", "video-alpha")
 	require.True(t, ok)
 	assert.Equal(t, "openai_responses", endpoint.Protocol)

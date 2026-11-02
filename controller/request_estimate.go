@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -21,7 +22,9 @@ import (
 
 // RequestEstimate stops at nominal pricing and never starts an upstream attempt.
 func RequestEstimate(c *gin.Context, relayFormat types.RelayFormat) {
-	if relayFormat == types.RelayFormatTask {
+	_, pinnedEndpoint := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
+	_, pinnedRoute := c.Get(pluginruntime.ContextKeyPinnedRoute)
+	if relayFormat == types.RelayFormatTask || pinnedEndpoint || pinnedRoute {
 		requestEstimateTask(c)
 		return
 	}

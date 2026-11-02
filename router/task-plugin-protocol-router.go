@@ -14,11 +14,15 @@ func SetTaskPluginProtocolRouter(router *gin.Engine) {
 	for _, protocol := range pluginruntime.HostProtocols() {
 		for _, operation := range protocol.Operations {
 			for _, method := range operation.Methods {
-				if protocol.Name == "openai_responses" && operation.Name == "create" {
-					registerRequestEstimateRoute(method, operation.Path, types.RelayFormatOpenAIResponses)
-				}
-				if protocol.Name == "openai_image" && (operation.Name == "generate" || operation.Name == "edit") {
-					registerRequestEstimateRoute(method, operation.Path, types.RelayFormatOpenAIImage)
+				if operation.ModelField != "" {
+					switch protocol.Name {
+					case "openai_responses":
+						registerRequestEstimateRoute(method, operation.Path, types.RelayFormatOpenAIResponses)
+					case "openai_image":
+						registerRequestEstimateRoute(method, operation.Path, types.RelayFormatOpenAIImage)
+					case "openai_video":
+						registerRequestEstimateRoute(method, operation.Path, types.RelayFormatTask)
+					}
 				}
 				handlers, err := taskPluginProtocolHandlers(protocol.Name, operation.Name)
 				if err != nil {

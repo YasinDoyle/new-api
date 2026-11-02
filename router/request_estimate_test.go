@@ -433,7 +433,7 @@ func TestRequestEstimateContract(t *testing.T) {
 		envelope["body"] = common.RawMessage(body)
 		envelope["method"], envelope["path"], envelope["body"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body)
 	})
-	t.Run("plugin-owned Responses model is not priced as a channel request", func(t *testing.T) {
+	t.Run("plugin-owned Responses model uses plugin channel routing", func(t *testing.T) {
 		registry := pluginruntime.NewRegistry()
 		_, err := registry.Register(`
 			export const meta = {
@@ -442,7 +442,7 @@ func TestRequestEstimateContract(t *testing.T) {
 				protocols: [{name: "openai_responses", models: ["plugin-responses-model"], supports: ["sync"]}]
 			};
 			export const protocols = {openai_responses: {
-				decodeRequest(request) { return {model: request.body.model, input: request.body.input}; },
+				decodeRequest(request) { return {kind: "submit", model: request.model, requestBody: request.body.value}; },
 				renderFinal() { return {}; }
 			}};
 			export function buildSubmitRequest() { return {}; }
@@ -456,7 +456,7 @@ func TestRequestEstimateContract(t *testing.T) {
 		t.Cleanup(func() { pluginruntime.DefaultRegistry = previous })
 		envelope["method"], envelope["path"] = http.MethodPost, "/v1/responses"
 		envelope["body"], envelope["headers"] = common.RawMessage(`{"model":"plugin-responses-model","input":"hello"}`), nil
-		assert.Equal(t, http.StatusUnprocessableEntity, quote(token.Key).Code)
+		assert.Equal(t, http.StatusServiceUnavailable, quote(token.Key).Code, "an unbound plugin request must not fall through to ordinary channel pricing")
 		envelope["method"], envelope["path"], envelope["body"], envelope["headers"] = http.MethodPost, "/v1/chat/completions", common.RawMessage(body), nil
 	})
 	t.Run("audio multipart accepts request-scoped duration facts", func(t *testing.T) {
@@ -1090,4 +1090,153 @@ func TestRequestEstimateGenericTaskPlugin(t *testing.T) {
 	assert.Zero(t, providerCalls.Load(), "arbitrary plugin fetches, including GET inference, must be rejected before network access")
 	assert.NotContains(t, fetchQuote.Body.String(), "channel-secret")
 	assert.NotContains(t, fetchQuote.Body.String(), "fetch-secret")
+}
+
+func TestRequestEstimateNativeAndHostProtocolRoutes(t *testing.T) {
+	setupRequestEstimateDB(t)
+	savedConfig := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(k, v string) error { savedConfig[k] = v; return nil }))
+	savedPrices := ratio_setting.ModelPrice2JSONString()
+	savedRegistry := pluginruntime.DefaultRegistry
+	t.Cleanup(func() {
+		pluginruntime.DefaultRegistry = savedRegistry
+		require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices))
+	})
+
+	registry := pluginruntime.NewRegistry()
+	plugin, err := registry.Register(`
+		export const meta = {
+		  apiVersion: 1, key: "estimate-dynamic-routes", name: "Estimate dynamic routes", version: "1.0.0",
+		  author: {name: "Test"}, models: ["dynamic-route-model"], fetchMode: "per_task",
+		  usageSchema: {seconds: {type: "number", unit: "second"}},
+		  routes: [
+		    {method: "POST", path: "/estimate-native/jobs/:task_id", type: "submit", action: "create", decode: "decodeNative", render: "renderNative"},
+		    {method: "PUT", path: "/estimate-native/jobs/:task_id", type: "submit", action: "create", decode: "decodeNative", render: "renderNative"}
+		  ],
+		  protocols: [{name: "openai_responses", supports: ["stream", "sync", "background"]}, "openai_image", "openai_video"]
+		};
+		export const native = {
+		  decodeNative(ctx) {
+		    if (ctx.path !== "/estimate-native/jobs/task-7" || ctx.params.task_id !== "task-7" || ctx.query.action[0] !== "extend" || !["POST", "PUT"].includes(ctx.method)) throw new Error("native request context was not preserved");
+		    return {kind: "submit", model: ctx.body.value.model, action: ctx.query.action[0], requestBody: {seconds: ctx.body.value.seconds}};
+		  },
+		  renderNative(ctx, task) { return task; }
+		};
+		export const protocols = {
+		  openai_image: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: ctx.body.value.seconds}}; }, render(ctx, task) { return {data: []}; }},
+		  openai_video: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: ctx.body.value.seconds}}; }, render(ctx, task) { return task.data; }},
+		  openai_responses: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: ctx.body.value.seconds}}; }, renderEvents() { return {events: [], state: null, done: false}; }, renderFinal(ctx, task) { return task.data; }}
+		};
+		export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/submit", method: "POST", body: ctx.requestBody}; }
+		export function extractUsage(ctx) { return {seconds: ctx.requestBody.seconds}; }
+		export function listArtifacts() { return []; }
+		export function buildContentRequest() { return {}; }
+		export function parseSubmitResponse() { return {taskId: "unused"}; }
+		export function buildQueryRequest() { return {}; }
+		export function parseTaskResult() { return {status: "SUCCESS"}; }
+	`, pluginruntime.Options{})
+	require.NoError(t, err)
+	require.NoError(t, registry.ReplaceOverrides(nil))
+	pluginruntime.DefaultRegistry = registry
+	variants, err := common.Marshal(map[string]string{billing_setting.PluginBillingExprKey(plugin.Meta.Key, "dynamic-route-model"): `tier("base", u("seconds") * 0.2)`})
+	require.NoError(t, err)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(variants)}))
+
+	var providerCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerCalls.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(upstream.Close)
+	user := model.User{Username: "estimate-dynamic-user", Status: common.UserStatusEnabled, Group: "default", Quota: 0}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "dynamicroutetoken", Status: common.TokenStatusExhausted, ExpiredTime: -1}
+	require.NoError(t, model.DB.Create(&token).Error)
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "dynamic-route-secret", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "dynamic-route-model", Group: "default"}
+	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "dynamic-route-model", ChannelId: channel.Id, Enabled: true}).Error)
+	model.InitChannelCache()
+
+	engine := gin.New()
+	require.NoError(t, engine.SetTrustedProxies(nil))
+	SetRelayRouter(engine)
+	SetTaskRouter(engine)
+	SetTaskPluginProtocolRouter(engine)
+	require.NoError(t, registry.ReplaceOverrides([]*pluginruntime.LoadedPlugin{plugin}))
+	quoteMethodWithBody := func(method, path, body string) *httptest.ResponseRecorder {
+		payload, marshalErr := common.Marshal(map[string]any{"method": method, "path": path, "body": common.RawMessage(body)})
+		require.NoError(t, marshalErr)
+		request := httptest.NewRequest(http.MethodPost, "/v1/requests/estimate", bytes.NewReader(payload))
+		request.Header.Set("Authorization", "Bearer "+token.Key)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		return response
+	}
+	quoteWithBody := func(path, body string) *httptest.ResponseRecorder {
+		return quoteMethodWithBody(http.MethodPost, path, body)
+	}
+	quote := func(path string) *httptest.ResponseRecorder {
+		return quoteWithBody(path, `{"model":"dynamic-route-model","seconds":2}`)
+	}
+	for _, target := range []string{
+		"/estimate-native/jobs/task-7?action=extend",
+		"/v1/images/generations",
+		"/v1/videos",
+		"/v1/responses",
+	} {
+		response := quote(target)
+		require.Equal(t, http.StatusOK, response.Code, target+": "+response.Body.String())
+		var result map[string]any
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.Equal(t, float64(200000), result["quota"])
+		assert.Equal(t, "0.4", result["amount"])
+		assert.Equal(t, plugin.Meta.Key, result["channel"].(map[string]any)["plugin"])
+	}
+	streamingResponse := quoteWithBody("/v1/responses", `{"model":"dynamic-route-model","seconds":2,"stream":true}`)
+	require.Equal(t, http.StatusOK, streamingResponse.Code, streamingResponse.Body.String())
+	assert.Equal(t, "application/json; charset=utf-8", streamingResponse.Header().Get("Content-Type"))
+	var streamingResult map[string]any
+	require.NoError(t, common.Unmarshal(streamingResponse.Body.Bytes(), &streamingResult))
+	assert.Equal(t, float64(200000), streamingResult["quota"])
+	putQuote := quoteMethodWithBody(http.MethodPut, "/estimate-native/jobs/task-7?action=extend", `{"model":"dynamic-route-model","seconds":2}`)
+	require.Equal(t, http.StatusOK, putQuote.Code, putQuote.Body.String())
+	replacement, err := registry.Register(`
+		export const meta = {
+		  apiVersion: 1, key: "estimate-dynamic-routes", name: "Estimate dynamic routes", version: "2.0.0",
+		  author: {name: "Test"}, models: ["dynamic-route-model"], fetchMode: "per_task",
+		  usageSchema: {seconds: {type: "number", unit: "second"}},
+		  routes: [
+		    {method: "POST", path: "/estimate-native/jobs/:task_id", type: "submit", action: "create", decode: "decodeNative", render: "renderNative"},
+		    {method: "PUT", path: "/estimate-native/jobs/:task_id", type: "submit", action: "create", decode: "decodeNative", render: "renderNative"}
+		  ],
+		  protocols: [{name: "openai_responses", supports: ["stream", "sync", "background"]}, "openai_image", "openai_video"]
+		};
+		export const native = {decodeNative(ctx) { return {kind: "submit", model: ctx.body.value.model, requestBody: {seconds: 1}}; }, renderNative(ctx, task) { return task; }};
+		export const protocols = {
+		  openai_image: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: 1}}; }, render(ctx, task) { return {data: []}; }},
+		  openai_video: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: 1}}; }, render(ctx, task) { return task.data; }},
+		  openai_responses: {decodeRequest(ctx) { return {kind: "submit", model: ctx.model, requestBody: {seconds: 1}}; }, renderEvents() { return {events: [], state: null, done: false}; }, renderFinal(ctx, task) { return task.data; }}
+		};
+		export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/submit", method: "POST", body: ctx.requestBody}; }
+		export function extractUsage(ctx) { return {seconds: ctx.requestBody.seconds}; }
+		export function listArtifacts() { return []; }
+		export function buildContentRequest() { return {}; }
+		export function parseSubmitResponse() { return {taskId: "unused"}; }
+		export function buildQueryRequest() { return {}; }
+		export function parseTaskResult() { return {status: "SUCCESS"}; }
+	`, pluginruntime.Options{})
+	require.NoError(t, err)
+	require.NoError(t, registry.ReplaceOverrides([]*pluginruntime.LoadedPlugin{replacement}))
+	updated := quote("/estimate-native/jobs/task-7?action=extend")
+	require.Equal(t, http.StatusOK, updated.Code, updated.Body.String())
+	var updatedResult map[string]any
+	require.NoError(t, common.Unmarshal(updated.Body.Bytes(), &updatedResult))
+	assert.Equal(t, float64(100000), updatedResult["quota"], "the next request must use the replacement generation")
+	require.NoError(t, registry.ReplaceOverrides(nil))
+	removed := quote("/estimate-native/jobs/task-7?action=extend")
+	assert.Equal(t, http.StatusUnprocessableEntity, removed.Code, removed.Body.String())
+	assert.Zero(t, providerCalls.Load(), "estimate must not submit to the provider")
 }
